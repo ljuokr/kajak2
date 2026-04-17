@@ -961,7 +961,9 @@ function startMusic() {
   }, 250);
 
   musicBus = ac.createGain();
-  musicBus.gain.setValueAtTime(0.22, ac.currentTime);
+  // Musik deutlich leiser als SFX/Noise — Melodie maximal 50% der Umgebungs-
+  // geräusche (Wasserrauschen 0.07 * master, SFX bis 0.9 * master).
+  musicBus.gain.setValueAtTime(0.13, ac.currentTime);
   musicBus.connect(masterGain);
 
   sfxBus = ac.createGain();
@@ -1084,9 +1086,10 @@ function startMusic() {
 
   function scheduleLoop(T) {
     for (let i = 0; i < BARS; i++) {
-      // Bass: halbe Noten, 2 pro Takt
+      // Bass: halbe Noten, 2 pro Takt. Triangle statt Sawtooth und leiser,
+      // damit der Bass die Melodie nicht übertönt — weniger aufdringlich.
       for (let j = 0; j < 2; j++) {
-        tone(bass[i], T + (i * BPB + j * 2) * b, 2 * b * 0.92, 'sawtooth', 0.2);
+        tone(bass[i], T + (i * BPB + j * 2) * b, 2 * b * 0.92, 'triangle', 0.09);
       }
       // Akkord-Pad
       chord[i].forEach(f => tone(f, T + i * BPB * b, BPB * b * 0.95, 'triangle', 0.055));
@@ -1109,30 +1112,48 @@ function playSplash() {
   if (!musicStarted || !sfxBus) return;
   const ac = musicCtx;
   const t = ac.currentTime;
-  // Gebrochenes, gefiltertes Rauschen + absteigender Ton = "plosh"
-  const buf = ac.createBuffer(1, ac.sampleRate * 0.55, ac.sampleRate);
+  // Wasser-Splash: gefiltertes Rauschen mit Sweep von hell nach dunkel, plus
+  // kurzer Höhenspritzer für die Tröpfchen. KEIN tiefer Sinus-„Plumps" — der
+  // klang vorher nach Knall/Faustschlag, nicht nach Wasser.
+  const bufLen = Math.floor(ac.sampleRate * 0.7);
+  const buf = ac.createBuffer(1, bufLen, ac.sampleRate);
   const d = buf.getChannelData(0);
-  for (let i = 0; i < d.length; i++) {
-    const p = i / d.length;
-    d[i] = (Math.random() * 2 - 1) * Math.exp(-p * 4);
+  let last = 0;
+  for (let i = 0; i < bufLen; i++) {
+    const p = i / bufLen;
+    // Leicht korreliertes Rauschen (wärmer als reines weißes Rauschen).
+    last = 0.9 * last + 0.1 * (Math.random() * 2 - 1);
+    // Scharfer Hit plus längerer Tail für das Ausschwingen.
+    const env = Math.exp(-p * 2.5) + 0.22 * Math.exp(-p * 6);
+    d[i] = last * 2.6 * env;
   }
   const src = ac.createBufferSource(); src.buffer = buf;
+  // Bandpass-Sweep: 1800 Hz → 420 Hz — Wasser „fällt und beruhigt sich".
   const bp = ac.createBiquadFilter();
-  bp.type = 'bandpass'; bp.frequency.value = 900; bp.Q.value = 0.6;
+  bp.type = 'bandpass';
+  bp.frequency.setValueAtTime(1800, t);
+  bp.frequency.exponentialRampToValueAtTime(420, t + 0.55);
+  bp.Q.value = 0.9;
   const g = ac.createGain();
-  g.gain.setValueAtTime(0.9, t);
-  g.gain.exponentialRampToValueAtTime(0.001, t + 0.55);
+  g.gain.setValueAtTime(0.75, t);
+  g.gain.exponentialRampToValueAtTime(0.001, t + 0.7);
   src.connect(bp); bp.connect(g); g.connect(sfxBus);
   src.start(t);
-  // Zusätzlicher tiefer "Plumps"
-  const o = ac.createOscillator(); const og = ac.createGain();
-  o.type = 'sine';
-  o.frequency.setValueAtTime(260, t);
-  o.frequency.exponentialRampToValueAtTime(55, t + 0.25);
-  og.gain.setValueAtTime(0.5, t);
-  og.gain.exponentialRampToValueAtTime(0.001, t + 0.35);
-  o.connect(og); og.connect(sfxBus);
-  o.start(t); o.stop(t + 0.4);
+
+  // Höhen-Tröpfchen: kurzes, scharf gefiltertes Hochpass-Rauschen.
+  const dropsBuf = ac.createBuffer(1, Math.floor(ac.sampleRate * 0.16), ac.sampleRate);
+  const dd = dropsBuf.getChannelData(0);
+  for (let i = 0; i < dd.length; i++) {
+    dd[i] = (Math.random() * 2 - 1) * Math.exp(-(i / dd.length) * 7);
+  }
+  const drops = ac.createBufferSource(); drops.buffer = dropsBuf;
+  const hp = ac.createBiquadFilter();
+  hp.type = 'highpass'; hp.frequency.value = 2600;
+  const dg = ac.createGain();
+  dg.gain.setValueAtTime(0.28, t);
+  dg.gain.exponentialRampToValueAtTime(0.001, t + 0.18);
+  drops.connect(hp); hp.connect(dg); dg.connect(sfxBus);
+  drops.start(t);
 }
 
 // "Nam-nam-nam" beim Essen: drei schnelle Tiefpass-Kauer-Impulse.
