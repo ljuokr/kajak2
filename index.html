@@ -975,9 +975,8 @@ function startMusic() {
   }, 250);
 
   musicBus = ac.createGain();
-  // Musik deutlich leiser als SFX/Noise — Melodie maximal 50% der Umgebungs-
-  // geräusche (Wasserrauschen 0.07 * master, SFX bis 0.9 * master).
-  musicBus.gain.setValueAtTime(0.13, ac.currentTime);
+  // Musik deutlich leiser als SFX/Noise — aber minim hörbarer als zuvor.
+  musicBus.gain.setValueAtTime(0.17, ac.currentTime);
   musicBus.connect(masterGain);
 
   sfxBus = ac.createGain();
@@ -1047,7 +1046,7 @@ function startMusic() {
     for (let i = 0; i < d.length; i++) d[i] = (Math.random() * 2 - 1) * Math.pow(1 - i / d.length, 2.2);
     const src = ac.createBufferSource(); src.buffer = buf;
     const hp = ac.createBiquadFilter(); hp.type = 'highpass'; hp.frequency.value = 1400;
-    const g = ac.createGain(); g.gain.value = 0.18;
+    const g = ac.createGain(); g.gain.value = 0.08;
     src.connect(hp); hp.connect(g); g.connect(musicBus);
     src.start(t);
   };
