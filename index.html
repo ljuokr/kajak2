@@ -918,9 +918,12 @@ let soundMuted = true;
 
 function startMusic() {
   if (musicStarted) {
-    // iOS / Chrome: Context kann nach Tab-Wechsel oder initialem Load
-    // "suspended" sein. Immer versuchen zu resumen.
-    if (musicCtx && musicCtx.state === 'suspended') musicCtx.resume();
+    // iOS / Chrome: Context kann nach Tab-Wechsel, Pause oder initialem Load
+    // "suspended" / "interrupted" sein. Immer versuchen zu resumen — der
+    // statechange-Listener unten kickt anschließend die Gain-Rampe neu an.
+    if (musicCtx && (musicCtx.state === 'suspended' || musicCtx.state === 'interrupted')) {
+      try { musicCtx.resume(); } catch (_) {}
+    }
     return;
   }
   try { musicCtx = new (window.AudioContext || window.webkitAudioContext)(); }
@@ -928,7 +931,9 @@ function startMusic() {
   musicStarted = true;
   const ac = musicCtx;
   // iOS: Context startet suspended bis zum ersten User-Gesture.
-  if (ac.state === 'suspended') ac.resume();
+  if (ac.state === 'suspended' || ac.state === 'interrupted') {
+    try { ac.resume(); } catch (_) {}
+  }
 
   // iOS-Unlock: ein leerer Buffer, synchron im Gesture abgespielt,
   // bringt Safari/iOS dazu, die Audio-Ausgabe freizugeben.
@@ -953,12 +958,12 @@ function startMusic() {
   };
   kickGain(0.15);
 
-  // Wenn der Context beim Scheduling noch suspended ist, kann das Scheduling
-  // verloren gehen. Daher erneut kicken, sobald state === 'running' wird.
+  // Bei JEDEM Übergang nach 'running' die Gain-Automation neu anstossen —
+  // Listener bleibt permanent, damit auch ein späteres Resume (z.B. nach
+  // Tab-Wechsel weg und wieder rein) den Ausgabe-Pfad re-aktiviert.
   const rescheduleOnRun = () => {
-    if (ac.state !== 'running') return;
-    ac.removeEventListener('statechange', rescheduleOnRun);
-    if (!soundMuted && masterGain.gain.value < 0.95) kickGain(0.12);
+    if (!masterGain || ac.state !== 'running') return;
+    if (!soundMuted) kickGain(0.1);
   };
   ac.addEventListener('statechange', rescheduleOnRun);
   if (ac.state === 'running') rescheduleOnRun();
@@ -1478,6 +1483,16 @@ cvs.addEventListener('touchend', e => {
 // Canvas-Touch nicht der einzige Weg zur Freigabe sein soll.
 ['touchstart', 'touchend', 'pointerdown', 'click'].forEach(ev => {
   document.addEventListener(ev, startMusic, { passive: true, capture: true });
+});
+
+// Wenn der Tab wieder sichtbar wird (aus dem Hintergrund zurück), den Context
+// proaktiv resumen. Reicht auf iOS nicht als User-Gesture, aber der nächste
+// Tap triggert dann den statechange-Listener und kickt die Gain-Rampe.
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState !== 'visible') return;
+  if (musicCtx && (musicCtx.state === 'suspended' || musicCtx.state === 'interrupted')) {
+    try { musicCtx.resume(); } catch (_) {}
+  }
 });
 
 // On-Screen Joystick: Paddel als Griff. Finger-Position im Kreisfeld liefert
