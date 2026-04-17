@@ -124,6 +124,7 @@ let secretsRevealed = 0;
 let distance = 0;
 let startY = 0;
 let gameOver = false;
+let paused = false;
 let tick = 0;
 let camY = 0;
 let difficulty = 1;
@@ -864,6 +865,7 @@ function init() {
   resetPlayer();
   obstacles.length = trees.length = collectibles.length = scorePops.length = splashes.length = 0;
   fishermen.length = fishes.length = policeBoats.length = 0;
+  paused = false;
   if (!bananaCache) bananaCache = buildBananaCache();
   if (!riegelCache) riegelCache = buildRiegelCache();
   populate();
@@ -874,7 +876,7 @@ window.addEventListener('DOMContentLoaded', init);
 if (document.readyState !== 'loading') init();
 window.addEventListener('resize', setSize);
 window.addEventListener('click', e => {
-  // Klick auf Ton-Button unten?
+  // Klick auf Ton-Button (oben links)?
   const rect = cvs.getBoundingClientRect();
   const cx = (e.clientX - rect.left) * (WIDTH / rect.width);
   const cy = (e.clientY - rect.top) * (HEIGHT / rect.height);
@@ -882,6 +884,13 @@ window.addEventListener('click', e => {
   if (cx >= btnX && cx <= btnX + btnW && cy >= btnY && cy <= btnY + btnH) {
     startMusic();
     toggleMute();
+    e.preventDefault();
+    return;
+  }
+  // Klick auf Pause-Button (oben rechts)?
+  const pbX = WIDTH - 52, pbY = 8, pbW = 44, pbH = 36;
+  if (cx >= pbX && cx <= pbX + pbW && cy >= pbY && cy <= pbY + pbH) {
+    togglePause();
     e.preventDefault();
     return;
   }
@@ -1416,6 +1425,11 @@ function toggleMute() {
   }
 }
 
+function togglePause() {
+  if (gameOver) return;  // bei GameOver ist der Tap = Neustart
+  paused = !paused;
+}
+
 window.addEventListener('click', startMusic);
 window.addEventListener('keydown', (e) => {
   if (e.key === 'm' || e.key === 'M') { e.preventDefault(); toggleMute(); return; }
@@ -1430,11 +1444,17 @@ cvs.addEventListener('touchstart', e => {
   const rect = cvs.getBoundingClientRect();
   const tx = (touch.clientX - rect.left) * (WIDTH / rect.width);
   const ty = (touch.clientY - rect.top) * (HEIGHT / rect.height);
-  // Ton-Button am unteren Rand (gleiche Geometrie wie in drawHUD).
+  // Ton-Button (oben links) — gleiche Geometrie wie in drawHUD.
   const btnX = 8, btnY = 8, btnW = 44, btnH = 36;
   if (tx >= btnX && tx <= btnX + btnW && ty >= btnY && ty <= btnY + btnH) {
     startMusic();
     toggleMute();
+    return;
+  }
+  // Pause-Button (oben rechts).
+  const pbX = WIDTH - 52, pbY = 8, pbW = 44, pbH = 36;
+  if (tx >= pbX && tx <= pbX + pbW && ty >= pbY && ty <= pbY + pbH) {
+    togglePause();
     return;
   }
   if (gameOver) { init(); return; }
@@ -1736,11 +1756,12 @@ function update() {
   if (tick % rockInt === 0) spawnRock();
   if (tick % logInt === 0) spawnLog();
   if (tick % 40 === 0) spawnTree();
-  if (tick % 100 === 0) spawnBanana();
-  if (tick % 200 === 0) spawnRiegel();
-  if (tick % 2700 === 0) spawnFish();
-  if (tick % 360 === 0) spawnFisherman();
-  if (tick % 1800 === 0) spawnPoliceBoat();
+  // Goodies +20% häufiger, Fischer/Polizei −20% seltener.
+  if (tick % 84   === 0) spawnBanana();
+  if (tick % 167  === 0) spawnRiegel();
+  if (tick % 2250 === 0) spawnFish();
+  if (tick % 432  === 0) spawnFisherman();
+  if (tick % 2160 === 0) spawnPoliceBoat();
 
   checkCollection();
   checkFishCollection();
@@ -2825,6 +2846,42 @@ function drawHUD() {
   }
   ctx.restore();
 
+  // Pause-Button oben rechts — symmetrisch zum Sound-Button.
+  ctx.save();
+  const pX = WIDTH - 52, pY = 8, pW = 44, pH = 36;
+  ctx.fillStyle = paused ? 'rgba(200, 150, 40, 0.92)' : 'rgba(46, 95, 138, 0.92)';
+  ctx.beginPath();
+  const pr = 6;
+  ctx.moveTo(pX + pr, pY);
+  ctx.lineTo(pX + pW - pr, pY);
+  ctx.quadraticCurveTo(pX + pW, pY, pX + pW, pY + pr);
+  ctx.lineTo(pX + pW, pY + pH - pr);
+  ctx.quadraticCurveTo(pX + pW, pY + pH, pX + pW - pr, pY + pH);
+  ctx.lineTo(pX + pr, pY + pH);
+  ctx.quadraticCurveTo(pX, pY + pH, pX, pY + pH - pr);
+  ctx.lineTo(pX, pY + pr);
+  ctx.quadraticCurveTo(pX, pY, pX + pr, pY);
+  ctx.closePath();
+  ctx.fill();
+  ctx.strokeStyle = '#000';
+  ctx.lineWidth = 1.5;
+  ctx.stroke();
+  // Icon: zwei Balken (||) wenn laufend, Dreieck (▶) wenn pausiert.
+  const pcX = pX + pW / 2, pcY = pY + pH / 2;
+  ctx.fillStyle = '#fff';
+  if (paused) {
+    ctx.beginPath();
+    ctx.moveTo(pcX - 6, pcY - 9);
+    ctx.lineTo(pcX - 6, pcY + 9);
+    ctx.lineTo(pcX + 9, pcY);
+    ctx.closePath();
+    ctx.fill();
+  } else {
+    ctx.fillRect(pcX - 8, pcY - 9, 5, 18);
+    ctx.fillRect(pcX + 3, pcY - 9, 5, 18);
+  }
+  ctx.restore();
+
   // Geheimzahlen aus dem Original: bei 100 / 200 / 300 Punkten erscheinen
   // 3, 2, 4 als goldene Ziffern oben mittig (links vom Level-Badge).
   ctx.save();
@@ -2898,6 +2955,29 @@ function drawHUD() {
     ctx.stroke();
     ctx.fillStyle = '#000';
     ctx.fillText(msg, WIDTH / 2, by + boxH / 2 + 1);
+    ctx.restore();
+  }
+
+  // PAUSE-Overlay — halbtransparentes Dim + grosser Schriftzug.
+  if (paused) {
+    ctx.save();
+    ctx.fillStyle = 'rgba(0, 0, 0, 0.55)';
+    ctx.fillRect(0, 0, WIDTH, HEIGHT);
+    ctx.fillStyle = '#FFD700';
+    ctx.font = '900 52px "Arial Black", Impact, sans-serif';
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.shadowColor = '#000';
+    ctx.shadowBlur = 6;
+    ctx.shadowOffsetX = 2;
+    ctx.shadowOffsetY = 2;
+    ctx.fillText('PAUSE', WIDTH / 2, HEIGHT / 2);
+    ctx.shadowBlur = 0;
+    ctx.shadowOffsetX = 0;
+    ctx.shadowOffsetY = 0;
+    ctx.font = 'bold 15px Arial';
+    ctx.fillStyle = '#fff';
+    ctx.fillText('Tipp ▶ oben rechts für weiter', WIDTH / 2, HEIGHT / 2 + 44);
     ctx.restore();
   }
 }
@@ -3691,12 +3771,19 @@ function loop(now) {
   // Maximal 5 update()-Ticks pro Frame, verhindert "spiral of death" bei Lag.
   try {
     let steps = 0;
-    while (_loopAcc >= FIXED_DT && steps < 5) {
-      update();
-      _loopAcc -= FIXED_DT;
-      steps++;
+    if (paused) {
+      // Pause: update() überspringen, Accumulator resetten. draw() läuft weiter,
+      // damit das HUD (Pause-Button/Overlay) reagiert und Animationen wie der
+      // Puls am Sound-Button weiter tickeln.
+      _loopAcc = 0;
+    } else {
+      while (_loopAcc >= FIXED_DT && steps < 5) {
+        update();
+        _loopAcc -= FIXED_DT;
+        steps++;
+      }
+      if (_loopAcc > FIXED_DT * 5) _loopAcc = 0;
     }
-    if (_loopAcc > FIXED_DT * 5) _loopAcc = 0;
     draw();
   } catch (err) {
     _loopError = err;
