@@ -1,0 +1,3374 @@
+<!DOCTYPE html>
+<html lang="de">
+<head>
+  <meta charset="UTF-8">
+  <title>Kajak Spiel</title>
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <style>
+    html, body {
+      margin: 0;
+      padding: 0;
+      height: 100%;
+      background: #222;
+      display: flex;
+      justify-content: center;
+      align-items: center;
+      overflow: hidden;
+    }
+    canvas {
+      border: 1px solid #444;
+      max-width: 100%;
+      height: auto;
+      touch-action: none;
+    }
+  </style>
+</head>
+<body>
+<canvas id="game"></canvas>
+<script>
+/* ---------- Display constants ---------- */
+const BASE_W = 390, BASE_H = 844;
+const cvs = document.getElementById('game');
+const ctx = cvs.getContext('2d');
+
+let WIDTH, HEIGHT, bankWidth, riverWidth, meanderAmp, meanderWave;
+const meanderPhase = Math.PI;
+const BASE_FLOW = -0.82;
+const PAD = 250;
+const LOG_MARGIN = 20;
+const MAX_PADDLE = Math.PI/3;
+
+/* ---------- Game state ---------- */
+const player = {
+  x: 0, y: 0, w: 28, h: 50,
+  vx: 0, vy: 0,
+  capsized: false, capsizeTime: 0,
+  invulnerable: false, invulnerableTime: 0
+};
+const obstacles = [];
+const trees = [];
+const collectibles = [];
+const scorePops = [];
+const splashes = [];
+const fishermen = [];
+const fishes = [];
+const policeBoats = [];
+let lives = 3;
+let score = 0;
+let secretsRevealed = 0;
+let distance = 0;
+let startY = 0;
+let gameOver = false;
+let tick = 0;
+let camY = 0;
+let difficulty = 1;
+const keys = {ArrowLeft: false, ArrowRight: false, ArrowUp: false, ArrowDown: false};
+
+let bananaCache = null, riegelCache = null;
+
+/* ---------- Utility ---------- */
+const rand = (a, b) => a + Math.random() * (b - a);
+const irregPoly = (a, b) => {
+  const pts = [];
+  for (let i = 0; i < 15; i++) {
+    const ang = i * 2 * Math.PI / 15;
+    pts.push({
+      x: a * (0.8 + Math.random() * 0.4) * Math.cos(ang),
+      y: b * (0.7 + Math.random() * 0.6) * Math.sin(ang)
+    });
+  }
+  return pts;
+};
+
+/* Schwierigkeit steigt sehr sanft und spät */
+function computeDifficulty() {
+  // 4 Level, je eines pro Geheimzahl — Level 2 & 3 deutlich stärker:
+  //   <30  = Level 1, schwach       (0.3×)   Rückwärtspaddeln easy
+  //   30-59 = Level 2, kräftig      (1.3×)
+  //   60-89 = Level 3, stark        (2.1×)
+  //   ≥90   = Level 4, sehr stark   (2.9×)
+  if (score < 25) return 0.3;
+  if (score < 30) return 0.3 + ((score - 25) / 5) * 1.0;    // 0.3 → 1.3
+  if (score < 55) return 1.3;
+  if (score < 60) return 1.3 + ((score - 55) / 5) * 0.8;    // 1.3 → 2.1
+  if (score < 85) return 2.1;
+  if (score < 90) return 2.1 + ((score - 85) / 5) * 0.8;    // 2.1 → 2.9
+  return 2.9;
+}
+
+/* ---------- Strömungszonen ----------
+   Entlang der y-Achse wechseln sich Abschnitte ab:
+   - ruhig (flowMul ca. 0.4)
+   - normal (flowMul ca. 1.0)
+   - Stromschnelle (flowMul ca. 1.7) */
+function flowMultiplier(y) {
+  // Zonen-Varianz deutlich reduziert (Range ca. 0.7 .. 1.3), damit Level
+  // die Optik und das Tempo dominieren — innerhalb eines Levels bleibt eine
+  // leichte Variation für Texturen.
+  const base = Math.sin(y / 1200) * 0.35 + Math.sin(y / 450 + 1.3) * 0.25;
+  return 1.0 + base * 0.5;
+}
+
+function zoneType(y) {
+  const m = flowMultiplier(y);
+  if (m < 0.7) return 'calm';
+  if (m > 1.55) return 'rapid';
+  return 'normal';
+}
+
+const waterEdges = y => {
+  const narrow = 1 - (difficulty - 1) * 0.15;
+  let leftEdge = bankWidth / narrow +
+    meanderAmp * 0.7 * Math.sin(y / meanderWave * 2 * Math.PI) +
+    meanderAmp * 0.3 * Math.sin(y / meanderWave * 3.5 * Math.PI);
+  let rightEdge = WIDTH - bankWidth / narrow +
+    meanderAmp * 0.8 * Math.sin(y / meanderWave * 2.5 * Math.PI + meanderPhase) +
+    meanderAmp * 0.2 * Math.sin(y / meanderWave * 4 * Math.PI + meanderPhase * 0.5);
+  // Mindest-Flussbreite: Kajak + Puffer — das Boot kommt IMMER durch, auch wenn
+  // Mäander + Level-Narrowing zufällig an derselben Stelle maximal eng werden.
+  const MIN_RIVER = (player.w || 28) + 34;   // ~62 px bei 28-px-Kajak
+  if (rightEdge - leftEdge < MIN_RIVER) {
+    const center = (leftEdge + rightEdge) / 2;
+    leftEdge = center - MIN_RIVER / 2;
+    rightEdge = center + MIN_RIVER / 2;
+  }
+  return [leftEdge, rightEdge];
+};
+
+const purge = arr => {
+  for (let i = arr.length - 1; i >= 0; i--) {
+    const r = arr[i].y - camY;
+    if (r < -PAD || r > HEIGHT + PAD) arr.splice(i, 1);
+  }
+};
+
+function isPlayerInWater() {
+  const [L, R] = waterEdges(player.y);
+  const points = [
+    { x: player.x, y: player.y },
+    { x: player.x - player.w/2, y: player.y - player.h/2 },
+    { x: player.x + player.w/2, y: player.y - player.h/2 },
+    { x: player.x - player.w/2, y: player.y + player.h/2 },
+    { x: player.x + player.w/2, y: player.y + player.h/2 }
+  ];
+  for (let p of points) {
+    if (p.x <= L || p.x >= R) return false;
+  }
+  return true;
+}
+
+function obbOverlap(ax, ay, aw, ah, aRot, bx, by, bw, bh, bRot) {
+  const corners = (cx, cy, w, h, r) => {
+    const c = Math.cos(r), s = Math.sin(r);
+    const hw = w / 2, hh = h / 2;
+    return [
+      { x: cx + (-hw) * c - (-hh) * s, y: cy + (-hw) * s + (-hh) * c },
+      { x: cx + ( hw) * c - (-hh) * s, y: cy + ( hw) * s + (-hh) * c },
+      { x: cx + ( hw) * c - ( hh) * s, y: cy + ( hw) * s + ( hh) * c },
+      { x: cx + (-hw) * c - ( hh) * s, y: cy + (-hw) * s + ( hh) * c }
+    ];
+  };
+  const A = corners(ax, ay, aw, ah, aRot);
+  const B = corners(bx, by, bw, bh, bRot);
+  const axes = [
+    { x: Math.cos(aRot), y: Math.sin(aRot) },
+    { x: -Math.sin(aRot), y: Math.cos(aRot) },
+    { x: Math.cos(bRot), y: Math.sin(bRot) },
+    { x: -Math.sin(bRot), y: Math.cos(bRot) }
+  ];
+  for (let ax1 of axes) {
+    let minA = Infinity, maxA = -Infinity, minB = Infinity, maxB = -Infinity;
+    for (let p of A) {
+      const dot = p.x * ax1.x + p.y * ax1.y;
+      if (dot < minA) minA = dot;
+      if (dot > maxA) maxA = dot;
+    }
+    for (let p of B) {
+      const dot = p.x * ax1.x + p.y * ax1.y;
+      if (dot < minB) minB = dot;
+      if (dot > maxB) maxB = dot;
+    }
+    if (maxA < minB || maxB < minA) return false;
+  }
+  return true;
+}
+
+function checkCollisions() {
+  if (player.capsized || gameOver || player.invulnerable) return;
+
+  if (!isPlayerInWater()) {
+    capsizeKayak();
+    return;
+  }
+
+  for (let o of obstacles) {
+    if (o.type === 'rock') {
+      const dx = player.x - o.x;
+      const dy = player.y - o.y;
+      const dist = Math.sqrt(dx * dx + dy * dy);
+      if (dist < o.rad + Math.max(player.w, player.h) / 2 * 0.8) {
+        capsizeKayak();
+        return;
+      }
+    } else if (o.type === 'log') {
+      const logX = o.x + Math.sin(tick * 0.05 + o.phase) * 2;
+      if (obbOverlap(
+        logX, o.y, o.len, o.wd, o.rot,
+        player.x, player.y, player.w, player.h, 0
+      )) {
+        capsizeKayak();
+        return;
+      }
+    }
+  }
+}
+
+function capsizeKayak() {
+  player.capsized = true;
+  player.capsizeTime = tick;
+  lives--;
+  player.vx = 0;
+  player.vy = 0;
+  playSplash();
+  // Grosse Spritzer-Wolke: schnelle Tropfen, mittlere Tropfen, Schaum und grosse Welle
+  for (let i = 0; i < 40; i++) {
+    const ang = rand(0, Math.PI * 2);
+    const speed = rand(1, 6);
+    splashes.push({
+      x: player.x + rand(-10, 10),
+      y: player.y + rand(-15, 15),
+      vx: Math.cos(ang) * speed,
+      vy: Math.sin(ang) * speed - rand(1, 3),
+      life: 60,
+      maxLife: 60,
+      r: rand(1.5, 3.5),
+      kind: 'drop'
+    });
+  }
+  // Grössere Schaum-Klumpen
+  for (let i = 0; i < 15; i++) {
+    const ang = rand(0, Math.PI * 2);
+    const speed = rand(0.5, 2.5);
+    splashes.push({
+      x: player.x + rand(-8, 8),
+      y: player.y + rand(-8, 8),
+      vx: Math.cos(ang) * speed,
+      vy: Math.sin(ang) * speed * 0.5 - rand(0.5, 1.5),
+      life: 80,
+      maxLife: 80,
+      r: rand(4, 8),
+      kind: 'foam'
+    });
+  }
+  // Zentraler Wellenring
+  splashes.push({
+    x: player.x,
+    y: player.y,
+    vx: 0, vy: 0,
+    life: 50,
+    maxLife: 50,
+    r: 5,
+    kind: 'ring'
+  });
+  splashes.push({
+    x: player.x,
+    y: player.y,
+    vx: 0, vy: 0,
+    life: 70,
+    maxLife: 70,
+    r: 3,
+    kind: 'ring'
+  });
+  if (lives <= 0) {
+    gameOver = true;
+    // Kajak sanft ans Ufer setzen: nächstes Ufer wählen
+    const [L, R] = waterEdges(player.y);
+    const distLeft = player.x - L;
+    const distRight = R - player.x;
+    if (distLeft < distRight) {
+      player.beachSide = 'L';
+      player.x = L - 5;  // leicht auf dem Sand
+    } else {
+      player.beachSide = 'R';
+      player.x = R + 5;
+    }
+    // Welt-Position des Ufers festhalten — Personen sitzen dort fix, während das Kajak weiter treibt.
+    // Suche eine freie Fläche auf der gewählten Uferseite (kein Baum in der Nähe).
+    {
+      const side = player.beachSide;
+      let bestY = player.y, bestClearance = -1;
+      for (let dy = -160; dy <= 160; dy += 12) {
+        const testY = player.y + dy;
+        let minTreeDist = Infinity;
+        for (const tr of trees) {
+          if (tr.side !== side) continue;
+          const yLow = tr.y, yHigh = tr.y + tr.h;
+          let d = testY < yLow ? yLow - testY : testY > yHigh ? testY - yHigh : 0;
+          if (d < minTreeDist) minTreeDist = d;
+        }
+        // Penalty, wenn zu weit vom Kajak: kleine Wichtung auf Distanz zum Player
+        const distPenalty = Math.abs(dy) * 0.05;
+        const score = minTreeDist - distPenalty;
+        if (score > bestClearance) { bestClearance = score; bestY = testY; }
+      }
+      const [bL, bR] = waterEdges(bestY);
+      player.beachAnchorX = side === 'L' ? bL - 5 : bR + 5;
+      player.beachAnchorY = bestY;
+    }
+    player.capsized = false;  // wieder aufgerichtet am Strand
+    // Paddel driftet als zweiter "Baumstamm" separat vom Kajak.
+    const side = player.beachSide;
+    player.paddleX = player.x + (side === 'L' ? 25 : -25);
+    player.paddleY = player.y + rand(-20, 20);
+    player.paddleRot = rand(0, Math.PI * 2);
+    player.paddleRotSpeed = rand(0.015, 0.028) * (Math.random() < 0.5 ? -1 : 1);
+    player.paddleDriftX = rand(-0.15, 0.15);
+    player.gameOverRot = 0;
+    player.gameOverRotSpeed = rand(0.008, 0.016) * (Math.random() < 0.5 ? -1 : 1);
+    // Sirene sofort fade-outen, damit sie nicht durchs ganze GameOver heult.
+    if (sirenActive && musicCtx) {
+      const acT = musicCtx.currentTime;
+      sirenActive.g.gain.cancelScheduledValues(acT);
+      sirenActive.g.gain.linearRampToValueAtTime(0, acT + 0.4);
+      const s = sirenActive;
+      setTimeout(() => { try { s.osc.stop(); s.lfo.stop(); } catch (e) {} }, 500);
+      sirenActive = null;
+    }
+    playGameOverSound();
+  }
+}
+
+function setSize() {
+  WIDTH = BASE_W;
+  HEIGHT = BASE_H;
+  cvs.width = WIDTH;
+  cvs.height = HEIGHT;
+  const scale = Math.min(window.innerWidth / BASE_W, window.innerHeight / BASE_H);
+  cvs.style.width = `${BASE_W * scale}px`;
+  cvs.style.height = `${BASE_H * scale}px`;
+  bankWidth = WIDTH * 0.2;
+  riverWidth = WIDTH - 2 * bankWidth;
+  meanderAmp = riverWidth * 0.4;
+  meanderWave = HEIGHT * 0.8;
+}
+
+function resetPlayer() {
+  player.x = WIDTH / 2;
+  player.y = HEIGHT / 2 + 200;
+  player.vx = 0; player.vy = 0;
+  player.capsized = false; player.capsizeTime = 0;
+  player.invulnerable = false; player.invulnerableTime = 0;
+  player.paddlePhase = 0; player.paddleAmp = 0;
+  lives = 3; score = 0; secretsRevealed = 0; gameOver = false;
+  distance = 0;
+  startY = player.y;
+  difficulty = 1;
+}
+
+function spawnRock() {
+  const y = player.y - HEIGHT / 2 - rand(0, HEIGHT * 1.5);
+  const [L, R] = waterEdges(y);
+  const riverW = R - L;
+  let x;
+  if (Math.random() < 0.8) x = L + rand(20, riverW - 40);
+  else x = Math.random() < 0.5 ? L + rand(-20, 20) : R + rand(-20, 20);
+  const rad = rand(15, 40);
+
+  // Sicherstellen, dass der Fluss nie ganz blockiert ist: in ähnlicher Höhe
+  // muss nach dem Platzieren mindestens eine kajakbreite Lücke übrig bleiben.
+  const minGap = 80;
+  const intervals = [[
+    Math.max(L, x - rad),
+    Math.min(R, x + rad)
+  ]];
+  for (const o of obstacles) {
+    if (o.type !== 'rock') continue;
+    if (Math.abs(o.y - y) > Math.max(rad, o.rad) + 25) continue;
+    intervals.push([
+      Math.max(L, o.x - o.rad),
+      Math.min(R, o.x + o.rad)
+    ]);
+  }
+  intervals.sort((a, b) => a[0] - b[0]);
+  const merged = [[intervals[0][0], intervals[0][1]]];
+  for (let i = 1; i < intervals.length; i++) {
+    const top = merged[merged.length - 1];
+    if (intervals[i][0] <= top[1] + 2) top[1] = Math.max(top[1], intervals[i][1]);
+    else merged.push([intervals[i][0], intervals[i][1]]);
+  }
+  let maxGap = Math.max(0, merged[0][0] - L);
+  for (let i = 1; i < merged.length; i++) {
+    maxGap = Math.max(maxGap, merged[i][0] - merged[i - 1][1]);
+  }
+  maxGap = Math.max(maxGap, R - merged[merged.length - 1][1]);
+  if (maxGap < minGap) return;
+
+  // Varianz: Farbfamilie, Aspect-Ratio (abgeflacht oder aufrecht), Rotation, Moos-Menge.
+  const paletteRoll = Math.random();
+  let basePal;
+  if (paletteRoll < 0.35) basePal = ['#4a4a4a', '#6a6a6a', '#8f8f8f', '#b0b0b0'];        // dunkelgrau
+  else if (paletteRoll < 0.7) basePal = ['#5a5a5a', '#7a7a7a', '#a0a0a0', '#c0c0c0'];   // mittelgrau (alt)
+  else if (paletteRoll < 0.88) basePal = ['#6a5c48', '#8a785f', '#ad9b7e', '#c9b999']; // bräunlich (Sandstein)
+  else basePal = ['#4a5a5e', '#6c7e82', '#8fa4a8', '#b4c6ca'];                           // bläulich (Granit)
+
+  const aspect = rand(0.7, 1.4);
+  const radX = rad * aspect;
+  const radY = rad / Math.sqrt(aspect);
+  const rockRot = rand(0, Math.PI * 2);
+  const mossAmount = Math.random() < 0.25 ? 0 : rand(0.55, 0.75);
+  const mossAng = rand(0, Math.PI * 2);
+  const mossOffset = { x: Math.cos(mossAng) * rad * 0.3, y: Math.sin(mossAng) * rad * 0.3 };
+
+  obstacles.push({
+    type: 'rock', x, y, rad,
+    radX, radY, rockRot,
+    mossOffset, mossAmount,
+    layers: [
+      { pts: irregPoly(radX, radY), col: basePal[0] },
+      { pts: irregPoly(radX * 0.95, radY * 0.95), col: basePal[1] },
+      { pts: irregPoly(radX * 0.7, radY * 0.7), col: basePal[2] },
+      { pts: irregPoly(radX * 0.35, radY * 0.35), col: basePal[3] }
+    ]
+  });
+}
+
+function spawnLog() {
+  const y = player.y - HEIGHT / 2 - rand(0, HEIGHT);
+  const [L, R] = waterEdges(y);
+  const riverW = R - L;
+  const x = L + rand(40, riverW - 80);
+  const len = rand(60, 110), wd = rand(18, 30);
+  const branches = [];
+  for (let i = 0; i < 3; i++) branches.push({ ang: rand(0, Math.PI * 2), len: rand(15, 30) });
+  obstacles.push({
+    type: 'log', x, y, vx: 0, vy: BASE_FLOW,
+    pts: irregPoly(len / 2, wd / 2),
+    branches, phase: rand(0, Math.PI * 2),
+    rot: rand(0, Math.PI * 2), rotSpeed: rand(-0.01, 0.01),
+    len: len, wd: wd
+  });
+}
+
+function spawnTree() {
+  const baseY = player.y - HEIGHT / 2 - rand(0, HEIGHT * 2);
+  const treeCount = Math.floor(rand(2, 4));
+  for (let i = 0; i < treeCount; i++) {
+    const side = Math.random() < 0.5 ? 'L' : 'R';
+    const y = baseY + rand(-100, 100);
+    trees.push({
+      side, off: rand(5, 30), y,
+      w: rand(20, 60), h: rand(40, 150),
+      trunkHeight: rand(10, 30),
+      type: Math.random() < 0.6 ? 'conifer' : 'oval',
+      shade: rand(0.85, 1.15)
+    });
+  }
+}
+
+function spawnBanana() {
+  const y = player.y - HEIGHT / 2 - rand(0, HEIGHT);
+  const [L, R] = waterEdges(y);
+  const x = L + rand(30, R - L - 60);
+  collectibles.push({
+    type: 'banana', x, y, w: 30, h: 20, collected: false,
+    bob: rand(0, Math.PI * 2),
+    rot: rand(-0.2, 0.2),
+    rotSpeed: rand(-0.008, 0.008)
+  });
+}
+
+function spawnRiegel() {
+  const y = player.y - HEIGHT / 2 - rand(0, HEIGHT);
+  const [L, R] = waterEdges(y);
+  const x = L + rand(30, R - L - 60);
+  collectibles.push({
+    type: 'riegel', x, y, w: 40, h: 25, collected: false,
+    bob: rand(0, Math.PI * 2),
+    rot: rand(-0.2, 0.2),
+    rotSpeed: rand(-0.006, 0.006)
+  });
+}
+
+function spawnFish() {
+  const y = player.y - rand(100, 300);
+  const [L, R] = waterEdges(y);
+  const riverW = R - L;
+  const x = L + rand(50, riverW - 100);
+  fishes.push({ x, y, w: 60, h: 35, speed: 0.5, collected: false });
+}
+
+function spawnFisherman() {
+  const side = Math.random() < 0.5 ? 'L' : 'R';
+  const y = player.y - HEIGHT / 2 - rand(0, HEIGHT);
+  // Rute zufällig entweder ins Wasser gehalten (angelnd) oder hochgestellt
+  // am Ufer — nur wenn die Rute im Wasser ist, gibt's Punktabzug.
+  fishermen.push({
+    side, y,
+    flashTime: 0, touched: false,
+    rodInWater: Math.random() < 0.55
+  });
+}
+
+function spawnPoliceBoat() {
+  const y = camY + HEIGHT - 100;
+  const [L, R] = waterEdges(y);
+  const riverW = R - L;
+  const x = L + rand(40, riverW - 80);
+  policeBoats.push({
+    x, y,
+    w: 72, h: 24,
+    vy: BASE_FLOW * 6,   // Dreimal so schnell wie vorher (war * 2)
+    blinkPhase: 0
+  });
+}
+
+function checkFishCollection() {
+  fishes.forEach(fish => {
+    if (!fish.collected && !player.capsized) {
+      const dx = Math.abs(player.x - fish.x);
+      const dy = Math.abs(player.y - fish.y);
+      if (dx < (fish.w + player.w) / 2 && dy < (fish.h + player.h) / 2) {
+        fish.collected = true;
+        if (lives < 3) lives++;
+        scorePops.push({ x: fish.x, y: fish.y, t: tick, pts: 'Leben' });
+        playNamNam();
+      }
+    }
+  });
+  for (let i = fishes.length - 1; i >= 0; i--) {
+    if (fishes[i].collected || fishes[i].y - camY < -PAD || fishes[i].y - camY > HEIGHT + PAD) {
+      fishes.splice(i, 1);
+    }
+  }
+}
+
+function checkFishermanCollision() {
+  if (player.capsized || gameOver || player.invulnerable) return;
+  fishermen.forEach(fisherman => {
+    if (!fisherman.rodInWater) return;  // Ohne Rute im Wasser kein Abzug
+    if (fisherman.hitCooldown && tick - fisherman.hitCooldown < 90) return;
+    const [L, R] = waterEdges(fisherman.y);
+    // Gleiche Platzierungsregel wie in drawFisherman: immer ausserhalb des Wassers.
+    const edgeGap = 15;
+    let adjustedX;
+    if (fisherman.side === 'L') {
+      adjustedX = Math.max(20, L - 40);
+      if (adjustedX > L - edgeGap) return;   // Fischer ist unsichtbar → keine Kollision
+    } else {
+      adjustedX = Math.min(WIDTH - 20, R + 40);
+      if (adjustedX < R + edgeGap) return;
+    }
+    const scale = 0.4;
+    const bobberX = fisherman.side === 'L'
+      ? adjustedX + 410 * scale
+      : adjustedX - 410 * scale;
+    const bobberY = fisherman.y + 240 * scale;
+
+    const bobberDx = Math.abs(player.x - bobberX);
+    const bobberDy = Math.abs(player.y - bobberY);
+    const fisherDx = Math.abs(player.x - adjustedX);
+    const fisherDy = Math.abs(player.y - fisherman.y);
+    const lineMinX = Math.min(adjustedX, bobberX);
+    const lineMaxX = Math.max(adjustedX, bobberX);
+    const linesOverlap = !(player.x + player.w / 2 < lineMinX || player.x - player.w / 2 > lineMaxX);
+    const isNearLineY = Math.abs(player.y - fisherman.y) < 150;
+
+    if ((bobberDx < 40 && bobberDy < 40) ||
+        (fisherDx < 50 && fisherDy < 80) ||
+        (linesOverlap && isNearLineY)) {
+      const penalty = 10;
+      score = Math.max(0, score - penalty);
+      scorePops.push({ x: player.x, y: player.y - 10, t: tick, pts: `-${penalty}` });
+      fisherman.hitCooldown = tick;
+      fisherman.flashTime = tick;
+      fisherman.touched = true;
+      playCurse();
+    }
+  });
+}
+
+function checkPoliceBoatCollision() {
+  if (player.capsized || gameOver || player.invulnerable) return;
+  for (const boat of policeBoats) {
+    const dx = Math.abs(player.x - boat.x);
+    const dy = Math.abs(player.y - boat.y);
+    if (dx < (boat.w + player.w) / 2 && dy < (boat.h + player.h) / 2) {
+      lives = 1;
+      capsizeKayak();
+      return;
+    }
+  }
+}
+
+function checkCollection() {
+  collectibles.forEach(item => {
+    // Mit voller Strömung treiben und leicht rotieren — im Kehrwasser rückwärts.
+    let localFlow = BASE_FLOW * difficulty * flowMultiplier(item.y);
+    if (isInEddy(item.x, item.y)) localFlow = -localFlow * 0.6;
+    item.y += localFlow;
+    item.rot += item.rotSpeed;
+    // Am Uferrand zurückstossen
+    const [L, R] = waterEdges(item.y);
+    if (item.x < L + 20) item.x = L + 20;
+    if (item.x > R - 20) item.x = R - 20;
+
+    if (!item.collected && !player.capsized) {
+      const dx = Math.abs(player.x - item.x);
+      const dy = Math.abs(player.y - item.y);
+      if (dx < (item.w + player.w) / 2 && dy < (item.h + player.h) / 2) {
+        item.collected = true;
+        const pts = item.type === 'banana' ? 5 : 20;
+        score += pts;
+        scorePops.push({ x: item.x, y: item.y, t: tick, pts });
+        playNamNam();
+      }
+    }
+  });
+  for (let i = collectibles.length - 1; i >= 0; i--) {
+    if (collectibles[i].collected || collectibles[i].y - camY < -PAD || collectibles[i].y - camY > HEIGHT + PAD) {
+      collectibles.splice(i, 1);
+    }
+  }
+  for (let i = scorePops.length - 1; i >= 0; i--) {
+    if (tick - scorePops[i].t > 60) scorePops.splice(i, 1);
+  }
+  for (let i = splashes.length - 1; i >= 0; i--) {
+    const s = splashes[i];
+    if (s.kind === 'ring') {
+      s.r += 1.2;
+      s.life--;
+    } else {
+      s.x += s.vx;
+      s.y += s.vy;
+      s.vy += s.kind === 'foam' ? 0.08 : 0.18;
+      s.vx *= 0.98;
+      s.life--;
+    }
+    if (s.life <= 0) splashes.splice(i, 1);
+  }
+}
+
+function populate() {
+  for (let i = 0; i < 20; i++) {
+    if (i % 3 === 0) spawnRock();
+    if (i % 4 === 0) spawnLog();
+    if (i % 2 === 0) spawnTree();
+    if (i % 5 === 0) spawnBanana();
+    if (i % 7 === 0) spawnRiegel();
+  }
+}
+
+/* ---------- Offscreen-Caches ---------- */
+function buildBananaCache() {
+  const c = document.createElement('canvas');
+  c.width = 80; c.height = 60;
+  const g = c.getContext('2d');
+  g.scale(0.18, 0.18);
+
+  function bananaPath() {
+    g.beginPath();
+    g.moveTo(70, 70);
+    g.bezierCurveTo(50, 120, 110, 180, 240, 125);
+    g.bezierCurveTo(260, 115, 265, 95, 255, 85);
+    g.bezierCurveTo(170, 140, 100, 100, 80, 70);
+    g.closePath();
+  }
+
+  g.save();
+  g.translate(4, 6);
+  g.fillStyle = 'rgba(0,0,0,0.25)';
+  bananaPath();
+  g.fill();
+  g.restore();
+
+  const grad = g.createLinearGradient(60, 60, 260, 140);
+  grad.addColorStop(0, '#fde476');
+  grad.addColorStop(0.5, '#f4d03f');
+  grad.addColorStop(1, '#d8a307');
+  g.fillStyle = grad;
+  g.strokeStyle = '#8a6a0a';
+  g.lineWidth = 5;
+  bananaPath();
+  g.fill();
+  g.stroke();
+
+  g.fillStyle = '#6b4a1f';
+  g.strokeStyle = '#4a3014';
+  g.lineWidth = 2;
+  g.beginPath();
+  g.moveTo(68, 45); g.lineTo(83, 45);
+  g.lineTo(78, 68); g.lineTo(73, 68);
+  g.closePath();
+  g.fill();
+  g.stroke();
+
+  g.save();
+  bananaPath();
+  g.clip();
+  g.strokeStyle = '#b38a04';
+  g.lineWidth = 2;
+  const ridges = [
+    { s: [92, 100], c1: [150, 135], c2: [210, 140], e: [253, 100] },
+    { s: [88, 108], c1: [145, 142], c2: [200, 150], e: [250, 108] }
+  ];
+  ridges.forEach(r => {
+    g.beginPath();
+    g.moveTo(...r.s);
+    g.bezierCurveTo(...r.c1, ...r.c2, ...r.e);
+    g.stroke();
+  });
+  g.strokeStyle = 'rgba(255,255,255,0.5)';
+  g.lineWidth = 3;
+  g.beginPath();
+  g.moveTo(100, 82);
+  g.bezierCurveTo(150, 108, 200, 112, 240, 95);
+  g.stroke();
+  g.restore();
+
+  return c;
+}
+
+function buildRiegelCache() {
+  const c = document.createElement('canvas');
+  c.width = 80; c.height = 50;
+  const g = c.getContext('2d');
+  g.translate(c.width / 2, c.height / 2);
+  g.scale(0.22, 0.22);
+  g.rotate(-Math.PI / 9);
+
+  function barPath() {
+    const topY = -40, bottomY = 40, leftX = -80, rightX = 80;
+    const zig = 6, dz = (bottomY - topY) / zig, dx = 6;
+    g.beginPath();
+    g.moveTo(leftX, topY);
+    for (let i = 0; i < zig; i++) {
+      const y = topY + i * dz;
+      g.lineTo(leftX - dx, y + (i % 2 ? dx : 0));
+      g.lineTo(leftX, y + dz);
+    }
+    g.lineTo(rightX, bottomY);
+    for (let i = zig - 1; i >= 0; i--) {
+      const y = topY + i * dz;
+      g.lineTo(rightX + dx, y + (i % 2 ? dx : 0));
+      g.lineTo(rightX, y);
+    }
+    g.closePath();
+  }
+
+  g.save();
+  g.translate(5, 7);
+  g.fillStyle = 'rgba(0,0,0,0.3)';
+  barPath();
+  g.fill();
+  g.restore();
+
+  const grad = g.createLinearGradient(-80, -40, 80, 40);
+  grad.addColorStop(0, '#c755d8');
+  grad.addColorStop(0.5, '#a030b5');
+  grad.addColorStop(1, '#6d1a80');
+  g.fillStyle = grad;
+  g.strokeStyle = '#5a1568';
+  g.lineWidth = 4;
+  barPath();
+  g.fill();
+  g.stroke();
+
+  g.save();
+  barPath();
+  g.clip();
+  g.fillStyle = 'rgba(255,255,255,0.18)';
+  g.fillRect(-90, -42, 180, 20);
+  g.restore();
+
+  g.fillStyle = '#ffffff';
+  g.textAlign = 'center';
+  g.textBaseline = 'middle';
+  g.font = 'bold 46px sans-serif';
+  g.fillText('FARMER', 0, -10);
+  g.font = '14px sans-serif';
+  g.fillText('GETREIDERIEGEL', 0, 20);
+
+  return c;
+}
+
+function init() {
+  setSize();
+  resetPlayer();
+  obstacles.length = trees.length = collectibles.length = scorePops.length = splashes.length = 0;
+  fishermen.length = fishes.length = policeBoats.length = 0;
+  if (!bananaCache) bananaCache = buildBananaCache();
+  if (!riegelCache) riegelCache = buildRiegelCache();
+  populate();
+  requestAnimationFrame(loop);
+}
+
+window.addEventListener('DOMContentLoaded', init);
+if (document.readyState !== 'loading') init();
+window.addEventListener('resize', setSize);
+window.addEventListener('click', e => {
+  // Klick auf Ton-Button unten?
+  const rect = cvs.getBoundingClientRect();
+  const cx = (e.clientX - rect.left) * (WIDTH / rect.width);
+  const cy = (e.clientY - rect.top) * (HEIGHT / rect.height);
+  const btnX = WIDTH / 2 - 22, btnY = HEIGHT - 44, btnW = 44, btnH = 36;
+  if (cx >= btnX && cx <= btnX + btnW && cy >= btnY && cy <= btnY + btnH) {
+    startMusic();
+    toggleMute();
+    e.preventDefault();
+    return;
+  }
+  if (gameOver) { e.preventDefault(); init(); }
+});
+
+window.addEventListener('keydown', e => {
+  if (e.key in keys) { e.preventDefault(); keys[e.key] = true; }
+});
+window.addEventListener('keyup', e => {
+  if (e.key in keys) { e.preventDefault(); keys[e.key] = false; }
+});
+
+/* ---------- Dramatische Seefahrermusik + Sound-Effekte ----------
+   Melodie: "What Shall We Do With the Drunken Sailor" (d-dorisch).
+   Akkord-Wechsel: Dm – C – Dm – C – Dm – C – Dm – A (Halbkadenz).
+   Plus: Wasser-Rauschen, Kenter-Splash, Mute-Toggle mit Taste M.   */
+let musicCtx = null, musicStarted = false;
+let masterGain = null, musicBus = null, sfxBus = null;
+let noiseGainNode = null, noiseLPNode = null;
+let soundMuted = false;
+
+function startMusic() {
+  if (musicStarted) {
+    // iOS / Chrome: Context kann nach Tab-Wechsel oder initialem Load
+    // "suspended" sein. Immer versuchen zu resumen.
+    if (musicCtx && musicCtx.state === 'suspended') musicCtx.resume();
+    return;
+  }
+  try { musicCtx = new (window.AudioContext || window.webkitAudioContext)(); }
+  catch (e) { return; }
+  musicStarted = true;
+  const ac = musicCtx;
+  // iOS: Context startet suspended bis zum ersten User-Gesture.
+  if (ac.state === 'suspended') ac.resume();
+
+  masterGain = ac.createGain();
+  masterGain.gain.value = soundMuted ? 0 : 1;
+  masterGain.connect(ac.destination);
+
+  musicBus = ac.createGain();
+  musicBus.gain.value = 0.22;
+  musicBus.connect(masterGain);
+
+  sfxBus = ac.createGain();
+  sfxBus.gain.value = 0.9;
+  sfxBus.connect(masterGain);
+
+  // --- Wasser-/Wind-Rauschen als Dauer-Loop ---
+  const noiseBuf = ac.createBuffer(2, ac.sampleRate * 4, ac.sampleRate);
+  for (let ch = 0; ch < 2; ch++) {
+    const d = noiseBuf.getChannelData(ch);
+    let last = 0;
+    for (let i = 0; i < d.length; i++) {
+      // leicht korreliertes (braunes) Rauschen für Wasser-Feel
+      last = 0.98 * last + 0.02 * (Math.random() * 2 - 1);
+      d[i] = last * 3;
+    }
+  }
+  const noiseSrc = ac.createBufferSource();
+  noiseSrc.buffer = noiseBuf; noiseSrc.loop = true;
+  const noiseLP = ac.createBiquadFilter();
+  noiseLP.type = 'lowpass'; noiseLP.frequency.value = 800;
+  const noiseHP = ac.createBiquadFilter();
+  noiseHP.type = 'highpass'; noiseHP.frequency.value = 120;
+  const noiseGain = ac.createGain(); noiseGain.gain.value = 0.07;
+  noiseSrc.connect(noiseHP); noiseHP.connect(noiseLP); noiseLP.connect(noiseGain);
+  noiseGain.connect(masterGain);
+  noiseGainNode = noiseGain;
+  noiseLPNode = noiseLP;
+  noiseSrc.start();
+
+  // --- Musik-Bausteine ---
+  const tone = (f, t, dur, type, vol) => {
+    const o = ac.createOscillator(), g = ac.createGain();
+    o.type = type; o.frequency.value = f;
+    g.gain.setValueAtTime(0, t);
+    g.gain.linearRampToValueAtTime(vol, t + 0.025);
+    g.gain.setValueAtTime(vol * 0.75, t + dur * 0.55);
+    g.gain.exponentialRampToValueAtTime(0.0008, t + dur);
+    o.connect(g); g.connect(musicBus);
+    o.start(t); o.stop(t + dur + 0.03);
+  };
+  const kick = (t) => {
+    const o = ac.createOscillator(), g = ac.createGain();
+    o.type = 'sine';
+    o.frequency.setValueAtTime(140, t);
+    o.frequency.exponentialRampToValueAtTime(45, t + 0.12);
+    g.gain.setValueAtTime(0.55, t);
+    g.gain.exponentialRampToValueAtTime(0.001, t + 0.18);
+    o.connect(g); g.connect(musicBus);
+    o.start(t); o.stop(t + 0.22);
+  };
+  const snare = (t) => {
+    const buf = ac.createBuffer(1, ac.sampleRate * 0.15, ac.sampleRate);
+    const d = buf.getChannelData(0);
+    for (let i = 0; i < d.length; i++) d[i] = (Math.random() * 2 - 1) * Math.pow(1 - i / d.length, 2.2);
+    const src = ac.createBufferSource(); src.buffer = buf;
+    const hp = ac.createBiquadFilter(); hp.type = 'highpass'; hp.frequency.value = 1400;
+    const g = ac.createGain(); g.gain.value = 0.18;
+    src.connect(hp); hp.connect(g); g.connect(musicBus);
+    src.start(t);
+  };
+
+  const N = {
+    D2: 73.4, F2: 87.3, G2: 98, A2: 110, Bb2: 116.5, C3: 130.8,
+    D3: 146.8, E3: 164.8, F3: 175, G3: 196, A3: 220, Bb3: 233.1, B3: 246.9,
+    C4: 261.6, Cs4: 277.2, D4: 293.7, E4: 329.6, F4: 349.2, G4: 392,
+    A4: 440, Bb4: 466.2, B4: 493.9, C5: 523.3, D5: 587.3, E5: 659.3
+  };
+  const bpm = 100, b = 60 / bpm, BARS = 8, BPB = 4;
+  const LOOP_DUR = BARS * BPB * b;
+
+  // Drunken-Sailor-Akkordfolge laut Spec (je 2 Takte pro Zeile):
+  // Teil A1 Dm | Teil A2 C | Teil B1 Dm | Teil B2 C→Dm
+  const bass = [N.D2, N.D2, N.C3, N.C3, N.D2, N.D2, N.C3, N.D2];
+  const chord = [
+    [N.D3, N.F3, N.A3],    // Takt 1: Dm
+    [N.D3, N.F3, N.A3],    // Takt 2: Dm
+    [N.C3, N.E3, N.G3],    // Takt 3: C
+    [N.C3, N.E3, N.G3],    // Takt 4: C
+    [N.D3, N.F3, N.A3],    // Takt 5: Dm
+    [N.D3, N.F3, N.A3],    // Takt 6: Dm
+    [N.C3, N.E3, N.G3],    // Takt 7: C ("Early in the")
+    [N.D3, N.F3, N.A3]     // Takt 8: Dm ("morning!")
+  ];
+
+  // Melodie exakt nach Spec:
+  // Teil A1 (Dm): A A A A A A D F A     — "What shall we do with the drunken sailor"
+  // Teil A2 (C):  G G G G G G C E G     — wiederholt
+  // Teil B1 (Dm): A A A A A H C' D'     — Aufstieg zum Refrain-Peak D5
+  // Teil B2 (C→Dm): A G F E D D         — "Early in the morning"
+  const melody = [
+    // Takt 1-2 (Dm): "What shall we do with the drun-ken sai-lor" auf A…A D F A
+    [N.A4, 0,    0.5], [N.A4, 0.5,  0.5], [N.A4, 1,    0.5], [N.A4, 1.5,  0.5],
+    [N.A4, 2,    0.5], [N.A4, 2.5,  0.5], [N.D4, 3,    0.5], [N.F4, 3.5,  0.5],
+    [N.A4, 4,    4],
+    // Takt 3-4 (C): "What shall we do with the drun-ken sai-lor" auf G…G C E G
+    [N.G4, 8,    0.5], [N.G4, 8.5,  0.5], [N.G4, 9,    0.5], [N.G4, 9.5,  0.5],
+    [N.G4, 10,   0.5], [N.G4, 10.5, 0.5], [N.C4, 11,   0.5], [N.E4, 11.5, 0.5],
+    [N.G4, 12,   4],
+    // Takt 5-6 (Dm): "What shall we do with the drun-ken sai-lor" auf A…A B C5 D5
+    [N.A4, 16,   0.5], [N.A4, 16.5, 0.5], [N.A4, 17,   0.5], [N.A4, 17.5, 0.5],
+    [N.A4, 18,   0.5], [N.B4, 18.5, 0.5], [N.C5, 19,   0.5], [N.D5, 19.5, 2.5],
+    // Takt 7 (C): "Ear-ly in the" auf A G F E
+    [N.A4, 24,   1],   [N.G4, 25,   1],   [N.F4, 26,   1],   [N.E4, 27,   1],
+    // Takt 8 (Dm): "mor-ning!" auf D D
+    [N.D4, 28,   2],   [N.D4, 30,   2]
+  ];
+
+  function scheduleLoop(T) {
+    for (let i = 0; i < BARS; i++) {
+      // Bass: halbe Noten, 2 pro Takt
+      for (let j = 0; j < 2; j++) {
+        tone(bass[i], T + (i * BPB + j * 2) * b, 2 * b * 0.92, 'sawtooth', 0.2);
+      }
+      // Akkord-Pad
+      chord[i].forEach(f => tone(f, T + i * BPB * b, BPB * b * 0.95, 'triangle', 0.055));
+    }
+    melody.forEach(([f, bo, d]) => tone(f, T + bo * b, d * b * 0.92, 'triangle', 0.13));
+    for (let i = 0; i < BARS * BPB; i++) {
+      if (i % 2 === 0) kick(T + i * b);
+      if (i % 4 === 2) snare(T + i * b);
+    }
+  }
+
+  let nextT = ac.currentTime + 0.2;
+  scheduleLoop(nextT); nextT += LOOP_DUR;
+  setInterval(() => {
+    if (ac.currentTime > nextT - 1.0) { scheduleLoop(nextT); nextT += LOOP_DUR; }
+  }, 400);
+}
+
+function playSplash() {
+  if (!musicStarted || !sfxBus) return;
+  const ac = musicCtx;
+  const t = ac.currentTime;
+  // Gebrochenes, gefiltertes Rauschen + absteigender Ton = "plosh"
+  const buf = ac.createBuffer(1, ac.sampleRate * 0.55, ac.sampleRate);
+  const d = buf.getChannelData(0);
+  for (let i = 0; i < d.length; i++) {
+    const p = i / d.length;
+    d[i] = (Math.random() * 2 - 1) * Math.exp(-p * 4);
+  }
+  const src = ac.createBufferSource(); src.buffer = buf;
+  const bp = ac.createBiquadFilter();
+  bp.type = 'bandpass'; bp.frequency.value = 900; bp.Q.value = 0.6;
+  const g = ac.createGain();
+  g.gain.setValueAtTime(0.9, t);
+  g.gain.exponentialRampToValueAtTime(0.001, t + 0.55);
+  src.connect(bp); bp.connect(g); g.connect(sfxBus);
+  src.start(t);
+  // Zusätzlicher tiefer "Plumps"
+  const o = ac.createOscillator(); const og = ac.createGain();
+  o.type = 'sine';
+  o.frequency.setValueAtTime(260, t);
+  o.frequency.exponentialRampToValueAtTime(55, t + 0.25);
+  og.gain.setValueAtTime(0.5, t);
+  og.gain.exponentialRampToValueAtTime(0.001, t + 0.35);
+  o.connect(og); og.connect(sfxBus);
+  o.start(t); o.stop(t + 0.4);
+}
+
+// "Nam-nam-nam" beim Essen: drei schnelle Tiefpass-Kauer-Impulse.
+function playNamNam() {
+  if (!musicStarted || !sfxBus) return;
+  const ac = musicCtx;
+  const t = ac.currentTime;
+  const beats = [0, 0.08, 0.16];
+  beats.forEach(off => {
+    const startT = t + off;
+    const osc = ac.createOscillator();
+    osc.type = 'triangle';
+    osc.frequency.setValueAtTime(290, startT);
+    osc.frequency.exponentialRampToValueAtTime(470, startT + 0.035);
+    osc.frequency.exponentialRampToValueAtTime(220, startT + 0.07);
+    const lp = ac.createBiquadFilter();
+    lp.type = 'lowpass'; lp.frequency.value = 700;
+    const g = ac.createGain();
+    g.gain.setValueAtTime(0, startT);
+    g.gain.linearRampToValueAtTime(0.3, startT + 0.01);
+    g.gain.exponentialRampToValueAtTime(0.001, startT + 0.08);
+    osc.connect(lp); lp.connect(g); g.connect(sfxBus);
+    osc.start(startT); osc.stop(startT + 0.1);
+  });
+}
+
+// Wütendes "HEY!"-Schreien vom Fischer — zwei kurze, hart einsetzende Rufe
+// mit abfallender Tonhöhe, rauer Saw-Distortion und Vokal-Formanten.
+function playCurse() {
+  if (!musicStarted || !sfxBus) return;
+  const ac = musicCtx;
+  const t = ac.currentTime;
+  // Zwei aufeinanderfolgende Schreie: "HEY!" – "HEY!"
+  const yells = [
+    { p: 520, s: 0,    d: 0.2 },
+    { p: 450, s: 0.26, d: 0.28 }
+  ];
+  yells.forEach(y => {
+    const sT = t + y.s;
+    // Haupt-Oszillator: Saw, fallende Tonhöhe (schreien hört frustriert auf)
+    const osc = ac.createOscillator();
+    osc.type = 'sawtooth';
+    osc.frequency.setValueAtTime(y.p * 1.25, sT);
+    osc.frequency.exponentialRampToValueAtTime(y.p * 0.75, sT + y.d);
+    // Vokal-Formanten (zwei Bandpässe = "ä"-Klang)
+    const f1 = ac.createBiquadFilter();
+    f1.type = 'bandpass'; f1.frequency.value = 850; f1.Q.value = 4;
+    const f2 = ac.createBiquadFilter();
+    f2.type = 'bandpass'; f2.frequency.value = 1600; f2.Q.value = 5;
+    // Harte Distortion (tanh × 5)
+    const ws = ac.createWaveShaper();
+    const curve = new Float32Array(512);
+    for (let i = 0; i < 512; i++) { const x = (i - 256) / 256; curve[i] = Math.tanh(x * 5); }
+    ws.curve = curve;
+    ws.oversample = '2x';
+    // Scharfer Attack-Envelope
+    const g = ac.createGain();
+    g.gain.setValueAtTime(0, sT);
+    g.gain.linearRampToValueAtTime(0.55, sT + 0.006);   // sehr schneller Attack
+    g.gain.setValueAtTime(0.42, sT + y.d * 0.3);
+    g.gain.exponentialRampToValueAtTime(0.001, sT + y.d);
+    // Mischung der beiden Formanten
+    const mix = ac.createGain(); mix.gain.value = 0.6;
+    osc.connect(f1); osc.connect(f2);
+    f1.connect(mix); f2.connect(mix);
+    mix.connect(ws); ws.connect(g); g.connect(sfxBus);
+    osc.start(sT); osc.stop(sT + y.d + 0.04);
+
+    // Atem-/Ruf-Rauschen on top für realistisches Schreien
+    const nBuf = ac.createBuffer(1, ac.sampleRate * y.d, ac.sampleRate);
+    const nD = nBuf.getChannelData(0);
+    for (let i = 0; i < nD.length; i++) {
+      const p = i / nD.length;
+      const env = Math.pow(1 - p, 1.5);
+      nD[i] = (Math.random() * 2 - 1) * env;
+    }
+    const nSrc = ac.createBufferSource(); nSrc.buffer = nBuf;
+    const nBP = ac.createBiquadFilter();
+    nBP.type = 'bandpass'; nBP.frequency.value = 2200; nBP.Q.value = 1;
+    const nG = ac.createGain(); nG.gain.value = 0.22;
+    nSrc.connect(nBP); nBP.connect(nG); nG.connect(sfxBus);
+    nSrc.start(sT);
+  });
+}
+
+// Triumphale Blechbläser-Fanfare, wenn eine Geheimzahl enthüllt wird.
+function playFanfare() {
+  if (!musicStarted || !sfxBus) return;
+  const ac = musicCtx;
+  const t = ac.currentTime;
+  // Aufstieg D4 – A4 – D5 – F#5 – A5 (gehalten)
+  const notes = [
+    { f: 293.7, s: 0,    d: 0.14 },
+    { f: 440,   s: 0.14, d: 0.14 },
+    { f: 587.3, s: 0.28, d: 0.14 },
+    { f: 740,   s: 0.42, d: 0.14 },
+    { f: 880,   s: 0.56, d: 0.8 }
+  ];
+  notes.forEach(n => {
+    const startT = t + n.s;
+    const o1 = ac.createOscillator(), o2 = ac.createOscillator();
+    o1.type = 'sawtooth'; o1.frequency.value = n.f;
+    o2.type = 'square';   o2.frequency.value = n.f; o2.detune.value = 7;
+    const bp = ac.createBiquadFilter();
+    bp.type = 'bandpass'; bp.frequency.value = n.f * 1.8; bp.Q.value = 1.5;
+    const g = ac.createGain();
+    g.gain.setValueAtTime(0, startT);
+    g.gain.linearRampToValueAtTime(0.32, startT + 0.015);
+    g.gain.setValueAtTime(0.28, startT + n.d * 0.7);
+    g.gain.exponentialRampToValueAtTime(0.001, startT + n.d);
+    o1.connect(bp); o2.connect(bp); bp.connect(g); g.connect(sfxBus);
+    o1.start(startT); o1.stop(startT + n.d + 0.04);
+    o2.start(startT); o2.stop(startT + n.d + 0.04);
+  });
+}
+
+// Dramatisches Game-Over: absteigende d-moll-Arpeggio + tiefer Schlussklang.
+function playGameOverSound() {
+  if (!musicStarted || !sfxBus) return;
+  const ac = musicCtx;
+  const t = ac.currentTime;
+  const arp = [587.3, 440, 349.2, 293.7]; // D5 A4 F4 D4
+  arp.forEach((f, i) => {
+    const startT = t + i * 0.22;
+    const o = ac.createOscillator();
+    o.type = 'sawtooth'; o.frequency.value = f;
+    const lp = ac.createBiquadFilter();
+    lp.type = 'lowpass'; lp.frequency.value = 1400;
+    const g = ac.createGain();
+    g.gain.setValueAtTime(0, startT);
+    g.gain.linearRampToValueAtTime(0.28, startT + 0.04);
+    g.gain.setValueAtTime(0.28, startT + 0.25);
+    g.gain.exponentialRampToValueAtTime(0.001, startT + 0.55);
+    o.connect(lp); lp.connect(g); g.connect(sfxBus);
+    o.start(startT); o.stop(startT + 0.6);
+  });
+  // Sustained D2+D3 Drone
+  const startT = t + 0.95;
+  [73.4, 146.8].forEach(f => {
+    const o = ac.createOscillator();
+    o.type = 'sawtooth'; o.frequency.value = f;
+    const g = ac.createGain();
+    g.gain.setValueAtTime(0, startT);
+    g.gain.linearRampToValueAtTime(0.35, startT + 0.1);
+    g.gain.setValueAtTime(0.35, startT + 1.6);
+    g.gain.exponentialRampToValueAtTime(0.001, startT + 3);
+    o.connect(g); g.connect(sfxBus);
+    o.start(startT); o.stop(startT + 3.1);
+  });
+}
+
+// Wasser-Rauschen skaliert mit der Strömung am aktuellen Spieler-Y:
+// ruhig = leise, Stromschnellen = deutlich lauter und heller.
+function updateWaterNoise() {
+  if (!musicStarted || !noiseGainNode) return;
+  // Rauschen folgt Zone × Level-Tempo: im schnellen Level rauscht selbst ruhiges
+  // Wasser deutlicher, in der Stromschnelle wird es zur Brandung.
+  const fm = flowMultiplier(player.y) * difficulty;
+  const intensity = Math.max(0.15, Math.min(3.5, fm));
+  const targetGain = 0.03 + intensity * 0.2;        // ~0.06 (langsam+calm) .. ~0.73 (schnell+rapid)
+  const targetLP = 420 + intensity * 1400;          // ~630 Hz .. ~5300 Hz
+  const t = musicCtx.currentTime;
+  noiseGainNode.gain.cancelScheduledValues(t);
+  noiseGainNode.gain.linearRampToValueAtTime(targetGain, t + 0.15);
+  noiseLPNode.frequency.cancelScheduledValues(t);
+  noiseLPNode.frequency.linearRampToValueAtTime(targetLP, t + 0.15);
+}
+
+// Leise Polizeisirene — läuft solange ein Polizeiboot auf dem Bildschirm ist.
+let sirenActive = null;
+function updatePoliceSiren() {
+  if (!musicStarted || !sfxBus) return;
+  const hasCops = policeBoats.some(b => {
+    const sy = b.y - camY;
+    return sy > -80 && sy < HEIGHT + 80;
+  });
+  if (hasCops && !sirenActive) {
+    const ac = musicCtx, t = ac.currentTime;
+    const osc = ac.createOscillator();
+    osc.type = 'square'; osc.frequency.value = 780;
+    const lfo = ac.createOscillator(); const lfoG = ac.createGain();
+    lfo.type = 'sine'; lfo.frequency.value = 2.6; lfoG.gain.value = 260;
+    lfo.connect(lfoG); lfoG.connect(osc.frequency);
+    const lp = ac.createBiquadFilter();
+    lp.type = 'lowpass'; lp.frequency.value = 2100;
+    const g = ac.createGain();
+    g.gain.setValueAtTime(0, t);
+    g.gain.linearRampToValueAtTime(0.045, t + 0.2);
+    osc.connect(lp); lp.connect(g); g.connect(sfxBus);
+    osc.start(t); lfo.start(t);
+    sirenActive = { osc, lfo, g };
+  } else if (!hasCops && sirenActive) {
+    const ac = musicCtx, t = ac.currentTime;
+    sirenActive.g.gain.cancelScheduledValues(t);
+    sirenActive.g.gain.linearRampToValueAtTime(0, t + 0.2);
+    const s = sirenActive;
+    setTimeout(() => { try { s.osc.stop(); s.lfo.stop(); } catch (e) {} }, 260);
+    sirenActive = null;
+  }
+}
+
+function toggleMute() {
+  soundMuted = !soundMuted;
+  if (masterGain) {
+    masterGain.gain.cancelScheduledValues(musicCtx.currentTime);
+    masterGain.gain.linearRampToValueAtTime(soundMuted ? 0 : 1, musicCtx.currentTime + 0.08);
+  }
+}
+
+window.addEventListener('click', startMusic);
+window.addEventListener('keydown', (e) => {
+  if (e.key === 'm' || e.key === 'M') { e.preventDefault(); toggleMute(); return; }
+  startMusic();
+});
+cvs.addEventListener('touchstart', startMusic, { passive: false });
+
+let touchTargetX = null, touchTargetY = null;
+cvs.addEventListener('touchstart', e => {
+  e.preventDefault();
+  const touch = e.touches[0];
+  const rect = cvs.getBoundingClientRect();
+  const tx = (touch.clientX - rect.left) * (WIDTH / rect.width);
+  const ty = (touch.clientY - rect.top) * (HEIGHT / rect.height);
+  // Ton-Button am unteren Rand (gleiche Geometrie wie in drawHUD).
+  const btnX = WIDTH / 2 - 22, btnY = HEIGHT - 44, btnW = 44, btnH = 36;
+  if (tx >= btnX && tx <= btnX + btnW && ty >= btnY && ty <= btnY + btnH) {
+    startMusic();
+    toggleMute();
+    return;
+  }
+  if (gameOver) { init(); return; }
+  touchTargetX = tx;
+  touchTargetY = ty + camY;
+}, { passive: false });
+cvs.addEventListener('touchmove', e => {
+  e.preventDefault();
+  const touch = e.touches[0];
+  const rect = cvs.getBoundingClientRect();
+  touchTargetX = (touch.clientX - rect.left) * (WIDTH / rect.width);
+  touchTargetY = (touch.clientY - rect.top) * (HEIGHT / rect.height) + camY;
+}, { passive: false });
+cvs.addEventListener('touchend', e => {
+  e.preventDefault();
+  touchTargetX = null; touchTargetY = null;
+}, { passive: false });
+
+function isInEddy(wx, wy) {
+  // Ellipse auf Downstream-Seite, in Fliessrichtung vertikal gestreckt — selbe Geometrie wie drawRock.
+  for (const o of obstacles) {
+    if (o.type !== 'rock') continue;
+    const rx = o.rad * 1.1;
+    const ry = o.rad * 2.4;
+    const radY = o.radY || o.rad;
+    const cy = o.y - radY * 0.9 - ry * 0.55;
+    const dx = wx - o.x;
+    const dy = wy - cy;
+    if ((dx * dx) / (rx * rx) + (dy * dy) / (ry * ry) < 1) return true;
+  }
+  return false;
+}
+
+function handleInput() {
+  if (player.capsized || gameOver) return;
+  const fm = flowMultiplier(player.y);  // ~0.25 (ruhig) bis ~1.9 (Stromschnelle)
+  let flow = BASE_FLOW * difficulty * fm;
+  if (isInEddy(player.x, player.y)) flow = -flow * 0.6;
+  // Seitenruder-Speed reagiert auf Strömung: in Stromschnellen schwerer zu steuern.
+  const steerFactor = Math.max(0.5, 1.55 - fm * 0.55);
+  const s = 2.75 * steerFactor;   // +25% Spieltempo
+
+  // Paddel-Rhythmus: Phase läuft nur, wenn tatsächlich gepaddelt wird.
+  // Vorwärts = lange, ruhige Schläge; Rückwärts = kürzere, schnellere Schläge;
+  // reine Lenkung = moderate Bewegung. Kein Input → Paddel gleitet in Ruhelage.
+  if (typeof player.paddlePhase !== 'number' || !isFinite(player.paddlePhase)) player.paddlePhase = 0;
+  if (typeof player.paddleAmp !== 'number' || !isFinite(player.paddleAmp)) player.paddleAmp = 0;
+  const steering = keys.ArrowLeft || keys.ArrowRight ||
+    (touchTargetX !== null && touchTargetY !== null);
+  let stroke = 0, targetAmp = 0;
+  if (keys.ArrowUp) { stroke = 0.14; targetAmp = MAX_PADDLE; }
+  else if (keys.ArrowDown) { stroke = 0.28; targetAmp = MAX_PADDLE * 0.55; }
+  else if (steering) { stroke = 0.17; targetAmp = MAX_PADDLE * 0.85; }
+  if (stroke > 0) {
+    player.paddlePhase += stroke;
+    player.paddleAmp = player.paddleAmp * 0.7 + targetAmp * 0.3;
+  } else {
+    player.paddleAmp *= 0.85;
+    const nearestZero = Math.round(player.paddlePhase / Math.PI) * Math.PI;
+    player.paddlePhase = player.paddlePhase * 0.88 + nearestZero * 0.12;
+  }
+
+  if (keys.ArrowLeft) player.vx = -s;
+  else if (keys.ArrowRight) player.vx = s;
+  else player.vx = 0;
+  // Ufer-Relativ-Speed koppelt stark an die Strömung.
+  // Vorwärts: Paddeleffekt + 1.6×Flow — in Stromschnellen spürbar schneller.
+  // Rückwärts: FIXER Paddel-Effort (entspricht ~Level-2-Normalströmung). Strömung
+  //            wird also mitgerechnet und überwiegt je nach Level:
+  //              Level 1 (0.3×) → vy > 0 → echtes Upstream
+  //              Level 2 (1.3×) → vy ≈ 0 → Stillstand
+  //              Level 3 (2.1×) → vy < 0 aber stark gebremst → Verlangsamung
+  //              Level 4 (2.9×) → noch immer forward, deutlich langsamer als Drift
+  if (keys.ArrowUp) player.vy = -2.0 + flow * 1.6;
+  else if (keys.ArrowDown) player.vy = -BASE_FLOW * 1.3 + flow;
+  else player.vy = flow;
+
+  if (touchTargetX !== null && touchTargetY !== null) {
+    const dx = touchTargetX - player.x;
+    const dy = touchTargetY - player.y;
+    const dist = Math.sqrt(dx * dx + dy * dy);
+    if (dist > 5) {
+      player.vx = (dx / dist) * s;
+      player.vy = (dy / dist) * s + flow;
+    } else {
+      player.vx = 0;
+      player.vy = flow;
+    }
+  }
+}
+
+function update() {
+  if (gameOver) {
+    // Welt läuft weiter, aber die Kamera steht still, damit die Strand-Szene
+    // am Ufer ruhig bleibt. Kajak und Paddel treiben als Baumstämme davon.
+    tick++;
+    let playerFlow = BASE_FLOW * difficulty * flowMultiplier(player.y);
+    if (isInEddy(player.x, player.y)) playerFlow = -playerFlow * 0.6;
+    player.y += playerFlow;
+    // camY bleibt eingefroren
+    player.gameOverRot = (player.gameOverRot || 0) + (player.gameOverRotSpeed || 0.012);
+    player.x += ((waterEdges(player.y)[0] + waterEdges(player.y)[1]) / 2 - player.x) * 0.02;
+    // Paddel eigenständig: Strömung, eigene Rotation, eigene x-Drift, reagiert auf Kehrwasser.
+    if (player.paddleY != null) {
+      let paddleFlow = BASE_FLOW * difficulty * flowMultiplier(player.paddleY);
+      if (isInEddy(player.paddleX, player.paddleY)) paddleFlow = -paddleFlow * 0.6;
+      player.paddleY += paddleFlow;
+      player.paddleRot += player.paddleRotSpeed;
+      player.paddleX += (player.paddleDriftX || 0);
+      const [pL, pR] = waterEdges(player.paddleY);
+      player.paddleX = Math.max(pL + 20, Math.min(pR - 20, player.paddleX));
+    }
+    // Collectibles und Hindernisse treiben mit voller Strömung, auch im Kehrwasser.
+    collectibles.forEach(item => {
+      let localFlow = BASE_FLOW * difficulty * flowMultiplier(item.y);
+      if (isInEddy(item.x, item.y)) localFlow = -localFlow * 0.6;
+      item.y += localFlow;
+      item.rot += item.rotSpeed;
+    });
+    obstacles.forEach(o => {
+      if (o.type === 'log') {
+        let localFlow = BASE_FLOW * difficulty * flowMultiplier(o.y);
+        if (isInEddy(o.x, o.y)) localFlow = -localFlow * 0.6;
+        o.vy = localFlow;
+        o.y += o.vy;
+        o.rot += o.rotSpeed;
+      }
+      // Felsen sind statisch
+    });
+    // Polizeiboote fahren auch bei Game Over weiter.
+    policeBoats.forEach(boat => {
+      boat.y += boat.vy;
+      boat.blinkPhase++;
+      const [pL, pR] = waterEdges(boat.y);
+      boat.x = Math.max(pL + boat.w / 2, Math.min(pR - boat.w / 2, boat.x));
+    });
+    purge(policeBoats);
+    // Sirene updaten, damit sie verstummt sobald alle Polizeiboote aus dem Bild sind.
+    updatePoliceSiren();
+    // Spritzer weiter animieren
+    for (let i = splashes.length - 1; i >= 0; i--) {
+      const s = splashes[i];
+      if (s.kind === 'ring') {
+        s.r += 1.2;
+        s.life--;
+      } else {
+        s.x += s.vx;
+        s.y += s.vy;
+        s.vy += s.kind === 'foam' ? 0.08 : 0.18;
+        s.vx *= 0.98;
+        s.life--;
+      }
+      if (s.life <= 0) splashes.splice(i, 1);
+    }
+    return;
+  }
+  handleInput();
+
+  if (!player.capsized) {
+    player.x += player.vx;
+    player.y += player.vy;
+  } else {
+    // Gekentert: Kajak + Personen + Paddel treiben wie ein Baumstamm mit voller Strömung.
+    const flow = BASE_FLOW * difficulty * flowMultiplier(player.y);
+    player.y += flow;
+    const [L, R] = waterEdges(player.y);
+    player.x += ((L + R) / 2 - player.x) * 0.05;
+  }
+
+  distance = Math.max(0, startY - player.y);
+  difficulty = computeDifficulty();
+
+  checkCollisions();
+  camY = player.y - HEIGHT * 0.4;
+
+  if (player.capsized && tick - player.capsizeTime > 120) {
+    player.capsized = false;
+    const [L, R] = waterEdges(player.y);
+    player.x = (L + R) / 2;
+    player.invulnerable = true;
+    player.invulnerableTime = tick;
+  }
+
+  if (player.invulnerable && tick - player.invulnerableTime > 180) {
+    player.invulnerable = false;
+  }
+
+  tick++;
+
+  const rockInt = Math.max(40, Math.floor(80 / difficulty));
+  const logInt = Math.max(80, Math.floor(150 / difficulty));
+  if (tick % rockInt === 0) spawnRock();
+  if (tick % logInt === 0) spawnLog();
+  if (tick % 40 === 0) spawnTree();
+  if (tick % 100 === 0) spawnBanana();
+  if (tick % 200 === 0) spawnRiegel();
+  if (tick % 2700 === 0) spawnFish();
+  if (tick % 360 === 0) spawnFisherman();
+  if (tick % 1800 === 0) spawnPoliceBoat();
+
+  checkCollection();
+  checkFishCollection();
+  checkFishermanCollision();
+  checkPoliceBoatCollision();
+
+  fishes.forEach(fish => {
+    const dx = player.x - fish.x;
+    const dy = player.y - fish.y;
+    const dist = Math.sqrt(dx * dx + dy * dy);
+    if (dist > 5) {
+      fish.x += (dx / dist) * fish.speed;
+      fish.y += (dy / dist) * fish.speed;
+    }
+    const [L, R] = waterEdges(fish.y);
+    // Körper ~58 px breit (Pfad -72..+82 * scale 0.4), Clamp großzügig damit
+    // der Delfin nicht mit dem Schwanz/der Schnauze ins Ufer ragt.
+    fish.x = Math.max(L + 40, Math.min(R - 40, fish.x));
+    // Wenn die Fluss-Mitte außerhalb des Flusses wäre (Fluss zu schmal),
+    // Delfin in die Mitte schieben.
+    if (L + 40 > R - 40) fish.x = (L + R) / 2;
+  });
+
+  // Polizeiboote — State-Machine: normal → back up → charge → jump → normal.
+  // Trifft ein Boot einen Stein, rutscht es erst zurück, nimmt dann Anlauf
+  // und schanzt sichtbar (Bogen via jumpOffset) über den Felsen.
+  policeBoats.forEach(boat => {
+    if (boat.jumpState == null) { boat.jumpState = 0; boat.jumpTimer = 0; boat.jumpOffset = 0; }
+    boat.blinkPhase++;
+
+    if (boat.jumpState === 0) {
+      // Normal vorwärts
+      boat.y += boat.vy;
+      let triggerJump = false, targetY = boat.y, targetRad = 30;
+      // 1) Stein-Kollision
+      for (const rock of obstacles) {
+        if (rock.type !== 'rock') continue;
+        const dx = boat.x - rock.x, dy = boat.y - rock.y;
+        const d2 = dx * dx + dy * dy;
+        const minDist = rock.rad + boat.w / 2;
+        if (d2 < minDist * minDist) {
+          triggerJump = true; targetY = rock.y; targetRad = rock.rad; break;
+        }
+      }
+      // 2) Holz-Kollision (Baumstämme versperren den Weg)
+      if (!triggerJump) {
+        for (const log of obstacles) {
+          if (log.type !== 'log') continue;
+          const lx = log.x + Math.sin(tick * 0.05 + log.phase) * 2;
+          const dx = boat.x - lx, dy = boat.y - log.y;
+          const logR = Math.max(log.len, log.wd) / 2;
+          const minD = logR + boat.w / 2;
+          if (dx * dx + dy * dy < minD * minD) {
+            triggerJump = true; targetY = log.y; targetRad = logR; break;
+          }
+        }
+      }
+      // 3) Fluss wird eng: Blick ein paar Frames voraus
+      if (!triggerJump) {
+        const lookAheadY = boat.y + boat.vy * 6;
+        const [lL, lR] = waterEdges(lookAheadY);
+        if (lR - lL < boat.w + 18) {
+          triggerJump = true; targetY = lookAheadY; targetRad = 22;
+        }
+      }
+      if (triggerJump) {
+        boat.jumpState = 1;
+        boat.jumpTimer = 0;
+        boat.targetRockY = targetY;
+        boat.targetRockRad = targetRad;
+      }
+    } else if (boat.jumpState === 1) {
+      // Anlauf zurück: entgegen der Strömungsrichtung (positive y)
+      boat.y += Math.abs(boat.vy) * 0.9;
+      boat.jumpTimer++;
+      if (boat.jumpTimer >= 22) { boat.jumpState = 2; boat.jumpTimer = 0; }
+    } else if (boat.jumpState === 2) {
+      // Charge: deutlich beschleunigtes Vorpreschen
+      boat.y += boat.vy * 1.8;
+      boat.jumpTimer++;
+      // Kurz vor dem Felsen abheben
+      if (Math.abs(boat.y - boat.targetRockY) < boat.targetRockRad + 18 || boat.jumpTimer >= 28) {
+        boat.jumpState = 3; boat.jumpTimer = 0;
+      }
+    } else if (boat.jumpState === 3) {
+      // Flug: schnelles Überqueren + Sprungbogen als visueller y-Offset
+      boat.y += boat.vy * 2.2;
+      const JUMP_DUR = 22;
+      boat.jumpOffset = Math.sin((boat.jumpTimer / JUMP_DUR) * Math.PI) * 48;
+      boat.jumpTimer++;
+      if (boat.jumpTimer >= JUMP_DUR) {
+        boat.jumpState = 0; boat.jumpTimer = 0; boat.jumpOffset = 0;
+      }
+      // Während der Flugphase keine Stein-Kollision.
+    }
+
+    // Flussgrenzen einhalten
+    const [L, R] = waterEdges(boat.y);
+    boat.x = Math.max(L + boat.w / 2, Math.min(R - boat.w / 2, boat.x));
+  });
+
+  obstacles.forEach(log => {
+    if (log.type === 'log') {
+      let localFlow = BASE_FLOW * difficulty * flowMultiplier(log.y);
+      if (isInEddy(log.x, log.y)) localFlow = -localFlow * 0.6;
+      log.vy = localFlow;
+      log.y += log.vy;
+      log.x += log.vx;
+      log.rot += log.rotSpeed;
+      if (Math.random() < 0.01) log.rotSpeed = rand(-0.02, 0.02);
+
+      obstacles.forEach(rock => {
+        if (rock.type === 'rock' && rock !== log) {
+          const dx = log.x - rock.x;
+          const dy = log.y - rock.y;
+          const dist = Math.sqrt(dx * dx + dy * dy);
+          const minDist = rock.rad + log.len / 2;
+          if (dist < minDist) {
+            const angle = Math.atan2(dy, dx);
+            log.x += Math.cos(angle) * (minDist - dist + 5) * 0.1;
+            log.vx = Math.cos(angle) * 0.5;
+            log.rotSpeed = rand(-0.03, 0.03);
+          }
+        }
+      });
+
+      log.vx *= 0.95;
+      const [L, R] = waterEdges(log.y);
+      const halfDiag = Math.sqrt((log.len / 2) ** 2 + (log.wd / 2) ** 2);
+      if (log.x - halfDiag < L + LOG_MARGIN) {
+        log.x = L + LOG_MARGIN + halfDiag;
+        log.vx = Math.abs(log.vx);
+        log.rotSpeed = rand(0.01, 0.03);
+      }
+      if (log.x + halfDiag > R - LOG_MARGIN) {
+        log.x = R - LOG_MARGIN - halfDiag;
+        log.vx = -Math.abs(log.vx);
+        log.rotSpeed = rand(-0.03, -0.01);
+      }
+    }
+  });
+
+  resolveOverlaps();
+  updatePoliceSiren();
+  updateWaterNoise();
+
+  purge(obstacles);
+  purge(trees);
+  purge(fishes);
+  purge(fishermen);
+  purge(policeBoats);
+}
+
+/* Sorgt dafür, dass bewegliche Objekte (Logs, Collectibles, Fische, Polizeiboote)
+   sich nicht überlagern. Statische Felsen drücken andere Objekte weg. */
+function resolveOverlaps() {
+  const items = [];
+  obstacles.forEach(o => {
+    if (o.type === 'log') items.push({ obj: o, r: Math.max(o.len, o.wd) / 2 * 0.85 });
+  });
+  collectibles.forEach(c => items.push({ obj: c, r: Math.max(c.w, c.h) / 2 }));
+  fishes.forEach(f => items.push({ obj: f, r: Math.max(f.w, f.h) / 2 }));
+  policeBoats.forEach(p => items.push({ obj: p, r: Math.max(p.w, p.h) / 2 * 0.9 }));
+
+  for (let pass = 0; pass < 2; pass++) {
+    // Paarweise auseinanderdrücken
+    for (let i = 0; i < items.length; i++) {
+      for (let j = i + 1; j < items.length; j++) {
+        const a = items[i], b = items[j];
+        const dx = b.obj.x - a.obj.x, dy = b.obj.y - a.obj.y;
+        const d2 = dx * dx + dy * dy;
+        const min = a.r + b.r;
+        if (d2 < min * min && d2 > 0.01) {
+          const d = Math.sqrt(d2);
+          const push = (min - d) * 0.5;
+          const nx = dx / d, ny = dy / d;
+          a.obj.x -= nx * push; a.obj.y -= ny * push;
+          b.obj.x += nx * push; b.obj.y += ny * push;
+        }
+      }
+    }
+    // Felsen sind unbeweglich, drücken aber andere weg
+    obstacles.forEach(rock => {
+      if (rock.type !== 'rock') return;
+      items.forEach(a => {
+        const dx = a.obj.x - rock.x, dy = a.obj.y - rock.y;
+        const d2 = dx * dx + dy * dy;
+        const min = rock.rad + a.r;
+        if (d2 < min * min && d2 > 0.01) {
+          const d = Math.sqrt(d2);
+          const push = (min - d);
+          a.obj.x += (dx / d) * push;
+          a.obj.y += (dy / d) * push;
+        }
+      });
+    });
+  }
+  // Nach den Korrekturen im Wasser halten.
+  items.forEach(a => {
+    const [L, R] = waterEdges(a.obj.y);
+    const m = Math.min(a.r, (R - L - 10) / 2);
+    a.obj.x = Math.max(L + m, Math.min(R - m, a.obj.x));
+  });
+}
+
+/* ---------- Zeichnen ---------- */
+
+function drawRock(o) {
+  const x = o.x, y = o.y - camY;
+  const radY = o.radY || o.rad;
+  const radX = o.radX || o.rad;
+
+  // Kehrwasser (Eddy) auf der Downstream-Seite (−y in Welt = oberhalb auf Screen).
+  // Oval in Fliessrichtung (vertikal gestreckt), auf das Wasser geclipped.
+  ctx.save();
+  const eddyRx = o.rad * 1.1;
+  const eddyRy = o.rad * 2.4;
+  const eddyCY = y - radY * 0.9 - eddyRy * 0.55;
+  const clipTop = Math.floor(Math.max(0, eddyCY - eddyRy - 2));
+  const clipBot = Math.ceil(Math.min(HEIGHT, eddyCY + eddyRy + 2));
+  if (clipBot > clipTop) {
+    ctx.beginPath();
+    for (let yy = clipTop; yy <= clipBot; yy += 1) {
+      const [wL] = waterEdges(yy + camY);
+      if (yy === clipTop) ctx.moveTo(wL, yy);
+      else ctx.lineTo(wL, yy);
+    }
+    for (let yy = clipBot; yy >= clipTop; yy -= 1) {
+      const [, wR] = waterEdges(yy + camY);
+      ctx.lineTo(wR, yy);
+    }
+    ctx.closePath();
+    ctx.clip();
+
+    // Ruhige, in Fliessrichtung gestreckte Wasserfläche
+    ctx.fillStyle = 'rgba(200, 225, 235, 0.32)';
+    ctx.beginPath();
+    ctx.ellipse(x, eddyCY, eddyRx, eddyRy, 0, 0, Math.PI * 2);
+    ctx.fill();
+
+    // Wirbel-Bögen, gegenläufig zur Hauptströmung
+    ctx.strokeStyle = 'rgba(255,255,255,0.5)';
+    ctx.lineWidth = 1.2;
+    const swirlT = tick * 0.045;
+    for (let i = 0; i < 3; i++) {
+      const phase = swirlT + i * (Math.PI * 2 / 3);
+      const sx = x + Math.cos(phase) * eddyRx * 0.5;
+      const sy = eddyCY + Math.sin(phase) * eddyRy * 0.55;
+      ctx.beginPath();
+      ctx.arc(sx, sy, 4, phase, phase + Math.PI * 1.4);
+      ctx.stroke();
+    }
+    // Schaumblasen am Rand
+    for (let i = 0; i < 6; i++) {
+      const phase = swirlT * 0.8 + i * Math.PI / 3;
+      const fx = x + Math.cos(phase) * eddyRx * 0.7;
+      const fy = eddyCY + Math.sin(phase) * eddyRy * 0.8;
+      const a = 0.4 + Math.sin(phase * 2 + tick * 0.1) * 0.25;
+      ctx.fillStyle = `rgba(240,250,255,${a})`;
+      ctx.beginPath();
+      ctx.arc(fx, fy, 1.7 + Math.sin(phase + tick * 0.08) * 0.6, 0, Math.PI * 2);
+      ctx.fill();
+    }
+  }
+  ctx.restore();
+
+  // Schatten unter dem Stein (leicht versetzt)
+  ctx.save();
+  ctx.translate(x, y);
+  ctx.rotate(o.rockRot || 0);
+  ctx.fillStyle = 'rgba(0,0,0,0.3)';
+  ctx.beginPath();
+  ctx.ellipse(4, 4, radX * 0.95, radY * 0.6, 0, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.restore();
+
+  // Stein-Layers (mit Rotation + Farbfamilie)
+  ctx.save();
+  ctx.translate(x, y);
+  ctx.rotate(o.rockRot || 0);
+  o.layers.forEach(l => {
+    ctx.fillStyle = l.col;
+    ctx.beginPath();
+    l.pts.forEach((p, i) => i ? ctx.lineTo(p.x, p.y) : ctx.moveTo(p.x, p.y));
+    ctx.closePath();
+    ctx.fill();
+  });
+  // Moos (optional, je nach mossAmount)
+  const mossAmount = (o.mossAmount != null) ? o.mossAmount : 0.55;
+  if (mossAmount > 0) {
+    ctx.fillStyle = `rgba(80, 120, 60, ${mossAmount})`;
+    ctx.beginPath();
+    ctx.ellipse(o.mossOffset.x, o.mossOffset.y, radX * 0.4, radY * 0.25, 0.3, 0, Math.PI * 2);
+    ctx.fill();
+  }
+  ctx.restore();
+}
+
+function drawLog(o) {
+  const x = o.x + Math.sin(tick * 0.05 + o.phase) * 2;
+  const y = o.y - camY;
+  ctx.save();
+  ctx.translate(x, y);
+  ctx.rotate(o.rot);
+
+  ctx.save();
+  ctx.translate(3, 4);
+  ctx.fillStyle = 'rgba(0,0,0,0.3)';
+  ctx.beginPath();
+  o.pts.forEach((p, i) => i ? ctx.lineTo(p.x, p.y) : ctx.moveTo(p.x, p.y));
+  ctx.closePath();
+  ctx.fill();
+  ctx.restore();
+
+  const grad = ctx.createLinearGradient(0, -o.wd / 2, 0, o.wd / 2);
+  grad.addColorStop(0, '#8a6440');
+  grad.addColorStop(0.5, '#6e4c30');
+  grad.addColorStop(1, '#4a3420');
+  ctx.fillStyle = grad;
+  ctx.beginPath();
+  o.pts.forEach((p, i) => i ? ctx.lineTo(p.x, p.y) : ctx.moveTo(p.x, p.y));
+  ctx.closePath();
+  ctx.fill();
+
+  ctx.strokeStyle = 'rgba(60, 40, 20, 0.6)';
+  ctx.lineWidth = 1.5;
+  for (let end of [-o.len / 2 + 4, o.len / 2 - 4]) {
+    for (let r = 2; r < o.wd / 2; r += 3) {
+      ctx.beginPath();
+      ctx.ellipse(end, 0, 2, r, 0, 0, Math.PI * 2);
+      ctx.stroke();
+    }
+  }
+
+  ctx.strokeStyle = 'rgba(60, 40, 20, 0.35)';
+  ctx.lineWidth = 1;
+  for (let yy = -o.wd / 2 + 4; yy < o.wd / 2; yy += 4) {
+    ctx.beginPath();
+    ctx.moveTo(-o.len / 2 + 5, yy + Math.sin(yy) * 1);
+    ctx.lineTo(o.len / 2 - 5, yy + Math.sin(yy + 2) * 1);
+    ctx.stroke();
+  }
+
+  ctx.strokeStyle = '#5a3c22';
+  ctx.lineWidth = 3;
+  o.branches.forEach(b => {
+    ctx.beginPath();
+    ctx.moveTo(0, 0);
+    ctx.lineTo(b.len * Math.cos(b.ang), b.len * Math.sin(b.ang));
+    ctx.stroke();
+  });
+  ctx.restore();
+}
+
+function drawBanana(banana) {
+  const bob = Math.sin(tick * 0.04 + banana.bob) * 2;
+  ctx.save();
+  ctx.translate(banana.x, banana.y - camY + bob);
+  ctx.rotate(banana.rot);
+  ctx.drawImage(bananaCache, -bananaCache.width / 2, -bananaCache.height / 2);
+  ctx.restore();
+}
+
+function drawRiegel(riegel) {
+  const bob = Math.sin(tick * 0.04 + riegel.bob) * 2;
+  ctx.save();
+  ctx.translate(riegel.x, riegel.y - camY + bob);
+  ctx.rotate(riegel.rot);
+  ctx.drawImage(riegelCache, -riegelCache.width / 2, -riegelCache.height / 2);
+  ctx.restore();
+}
+
+function drawTree(t) {
+  const y = t.y - camY;
+  if (y < -t.h || y > HEIGHT + t.h) return;
+  // Wasserkanten über die gesamte Baumhöhe sampeln und die am weitesten
+  // ins Land ragende Kante verwenden — so ragt weder Stamm noch Krone
+  // in den Fluss, auch wenn der Mäander auf verschiedenen Höhen unterschiedlich steht.
+  let L = Infinity, R = -Infinity;
+  for (let wy = t.y; wy <= t.y + t.h; wy += 6) {
+    const [eL, eR] = waterEdges(wy);
+    if (eL < L) L = eL;
+    if (eR > R) R = eR;
+  }
+  const trunkWidth = t.w * 0.2;
+  let x;
+  if (t.side === 'L') {
+    x = L - t.w - t.off;
+    if (x < 0) x = 0;
+    if (x + t.w > L - 1) return;
+  } else {
+    x = R + t.off;
+    if (x + t.w > WIDTH) x = WIDTH - t.w;
+    if (x < R + 1) return;
+  }
+
+  const cx = x + t.w / 2;
+  const groundY = y + t.h;                  // unteres Ende des Stamms
+  const trunkTopY = groundY - t.trunkHeight; // oberes Ende des Stamms
+
+  // Bodenschatten
+  ctx.save();
+  ctx.fillStyle = 'rgba(0,0,0,0.25)';
+  ctx.beginPath();
+  ctx.ellipse(cx, groundY - 2, t.w * 0.5, t.h * 0.08, 0, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.restore();
+
+  // Stamm
+  const trunkGrad = ctx.createLinearGradient(cx - trunkWidth / 2, 0, cx + trunkWidth / 2, 0);
+  trunkGrad.addColorStop(0, '#4a2f1a');
+  trunkGrad.addColorStop(0.5, '#6b4528');
+  trunkGrad.addColorStop(1, '#3a2514');
+  ctx.fillStyle = trunkGrad;
+  ctx.fillRect(cx - trunkWidth / 2, trunkTopY, trunkWidth, t.trunkHeight);
+
+  if (t.type === 'oval') {
+    // Laubbaum: Krone sitzt auf dem Stamm, überlappt ihn oben um ~30% der Kronenhöhe
+    const crownHeight = t.h - t.trunkHeight;
+    const crownRx = t.w * 0.5;
+    const crownRy = crownHeight * 0.55;
+    // Kronenmittelpunkt: so dass untere Kante knapp über Stammoberkante liegt
+    const crownCY = trunkTopY - crownRy * 0.65;
+
+    const baseCol = `hsl(140, 45%, ${Math.min(45, 30 * t.shade)}%)`;
+    const midCol = `hsl(130, 50%, ${Math.min(55, 40 * t.shade)}%)`;
+    const hiCol = `hsl(120, 55%, ${Math.min(65, 50 * t.shade)}%)`;
+
+    // Basis-Krone
+    ctx.fillStyle = baseCol;
+    ctx.beginPath();
+    ctx.ellipse(cx, crownCY, crownRx, crownRy, 0, 0, Math.PI * 2);
+    ctx.fill();
+
+    // Seitliche Ausbuchtungen
+    ctx.fillStyle = midCol;
+    ctx.beginPath();
+    ctx.ellipse(cx - crownRx * 0.35, crownCY + crownRy * 0.1, crownRx * 0.55, crownRy * 0.6, 0, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.beginPath();
+    ctx.ellipse(cx + crownRx * 0.35, crownCY + crownRy * 0.1, crownRx * 0.55, crownRy * 0.6, 0, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.beginPath();
+    ctx.ellipse(cx, crownCY - crownRy * 0.3, crownRx * 0.65, crownRy * 0.55, 0, 0, Math.PI * 2);
+    ctx.fill();
+
+    // Highlight
+    ctx.fillStyle = hiCol;
+    ctx.beginPath();
+    ctx.ellipse(cx - crownRx * 0.35, crownCY - crownRy * 0.35, crownRx * 0.25, crownRy * 0.25, 0, 0, Math.PI * 2);
+    ctx.fill();
+  } else {
+    // Nadelbaum: drei Dreiecke, die überlappen und den Stamm von oben bedecken
+    const topY = y;                                  // Spitze oben
+    const crownBottomY = trunkTopY + t.trunkHeight * 0.25; // deckt Stammoberkante leicht ab
+    const totalCrownH = crownBottomY - topY;
+    // Drei Ebenen, jede beginnt etwas weiter unten und ist breiter
+    const layers = [
+      { top: topY, bottom: topY + totalCrownH * 0.45, width: t.w * 0.55, col: `hsl(125, 55%, ${Math.min(55, 40 * t.shade)}%)` },
+      { top: topY + totalCrownH * 0.3, bottom: topY + totalCrownH * 0.72, width: t.w * 0.78, col: `hsl(130, 55%, ${Math.min(50, 32 * t.shade)}%)` },
+      { top: topY + totalCrownH * 0.55, bottom: crownBottomY, width: t.w * 1.0, col: `hsl(135, 55%, ${Math.min(45, 25 * t.shade)}%)` }
+    ];
+    layers.forEach(layer => {
+      ctx.fillStyle = layer.col;
+      ctx.beginPath();
+      ctx.moveTo(cx, layer.top);
+      ctx.lineTo(cx - layer.width / 2, layer.bottom);
+      ctx.lineTo(cx + layer.width / 2, layer.bottom);
+      ctx.closePath();
+      ctx.fill();
+      // Linkes Highlight
+      ctx.fillStyle = 'rgba(255,255,255,0.12)';
+      ctx.beginPath();
+      ctx.moveTo(cx, layer.top);
+      ctx.lineTo(cx - layer.width / 2, layer.bottom);
+      ctx.lineTo(cx - layer.width / 4, layer.bottom);
+      ctx.closePath();
+      ctx.fill();
+    });
+  }
+}
+
+function drawPaddler(offset, phase, amp, isBack, yOffset) {
+  // Defensiv: NaN/undefined führen zu 0, damit ctx.rotate nie mit ungültigem Wert beschickt wird.
+  if (!isFinite(phase)) phase = 0;
+  if (!isFinite(amp)) amp = 0;
+  const cx = player.x + offset, cy = player.y - camY + yOffset;
+  ctx.save();
+  ctx.translate(cx, cy);
+  ctx.rotate(Math.sin(phase) * amp);
+  ctx.strokeStyle = '#222';
+  ctx.lineWidth = 3;
+  ctx.beginPath();
+  ctx.moveTo(-25, 0); ctx.lineTo(25, 0);
+  ctx.stroke();
+  ctx.fillStyle = '#1a1a1a';
+  ctx.beginPath();
+  ctx.moveTo(-25, -4);
+  ctx.quadraticCurveTo(-35, -6, -40, -5);
+  ctx.lineTo(-40, 5);
+  ctx.quadraticCurveTo(-35, 6, -25, 4);
+  ctx.closePath();
+  ctx.fill();
+  ctx.beginPath();
+  ctx.moveTo(25, -4);
+  ctx.quadraticCurveTo(35, -6, 40, -5);
+  ctx.lineTo(40, 5);
+  ctx.quadraticCurveTo(35, 6, 25, 4);
+  ctx.closePath();
+  ctx.fill();
+
+  ctx.fillStyle = isBack ? '#FFD700' : '#2a2a2a';
+  ctx.beginPath();
+  ctx.ellipse(0, 0, 6, 8, 0, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.fillStyle = 'rgba(255,255,255,0.3)';
+  ctx.beginPath();
+  ctx.ellipse(-1.5, -2, 2.5, 3, 0, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.restore();
+}
+
+function drawCapsizedPerson(x, y, isBlond) {
+  ctx.fillStyle = isBlond ? '#FFD700' : '#2a2a2a';
+  ctx.beginPath();
+  ctx.arc(x, y, 6, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.fillStyle = 'rgba(255,255,255,0.3)';
+  ctx.beginPath();
+  ctx.arc(x - 1.5, y - 2, 2, 0, Math.PI * 2);
+  ctx.fill();
+
+  const paddleAngle = isBlond ? Math.PI / 6 : -Math.PI / 6;
+  ctx.save();
+  ctx.translate(x, y + 20);
+  ctx.rotate(paddleAngle);
+  ctx.strokeStyle = '#222';
+  ctx.lineWidth = 2;
+  ctx.beginPath();
+  ctx.moveTo(-20, 0); ctx.lineTo(20, 0);
+  ctx.stroke();
+  ctx.fillStyle = '#1a1a1a';
+  ctx.beginPath();
+  ctx.moveTo(-20, -4);
+  ctx.quadraticCurveTo(-30, -6, -35, -5);
+  ctx.lineTo(-35, 5);
+  ctx.quadraticCurveTo(-30, 6, -20, 4);
+  ctx.closePath();
+  ctx.fill();
+  ctx.beginPath();
+  ctx.moveTo(20, -4);
+  ctx.quadraticCurveTo(30, -6, 35, -5);
+  ctx.lineTo(35, 5);
+  ctx.quadraticCurveTo(30, 6, 20, 4);
+  ctx.closePath();
+  ctx.fill();
+  ctx.restore();
+}
+
+function drawKayak() {
+  const kayakY = player.y - camY;
+
+  // Strand-Szene bei Game Over: Kajak horizontal am Ufer, zwei Personen mit Bier daneben
+  if (gameOver) {
+    drawBeachScene(kayakY);
+    return;
+  }
+
+  ctx.save();
+  ctx.fillStyle = 'rgba(0,0,0,0.25)';
+  ctx.beginPath();
+  ctx.ellipse(player.x + 5, kayakY + 8, player.w / 2 + 3, player.h / 2 + 8, 0, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.restore();
+
+  if (!player.capsized) {
+    if (player.invulnerable && Math.floor(tick / 10) % 2 === 0) ctx.globalAlpha = 0.5;
+
+    const grad = ctx.createLinearGradient(player.x - player.w / 2, kayakY, player.x + player.w / 2, kayakY);
+    grad.addColorStop(0, '#B02800');
+    grad.addColorStop(0.5, '#FF5A1F');
+    grad.addColorStop(1, '#C23B0B');
+    ctx.fillStyle = grad;
+    ctx.beginPath();
+    ctx.moveTo(player.x, kayakY - player.h / 2 - 10);
+    ctx.quadraticCurveTo(player.x + player.w / 2 + 5, kayakY - player.h / 4, player.x + player.w / 2, kayakY);
+    ctx.quadraticCurveTo(player.x + player.w / 2 + 5, kayakY + player.h / 4, player.x, kayakY + player.h / 2 + 10);
+    ctx.quadraticCurveTo(player.x - player.w / 2 - 5, kayakY + player.h / 4, player.x - player.w / 2, kayakY);
+    ctx.quadraticCurveTo(player.x - player.w / 2 - 5, kayakY - player.h / 4, player.x, kayakY - player.h / 2 - 10);
+    ctx.closePath();
+    ctx.fill();
+
+    ctx.strokeStyle = '#5a1200';
+    ctx.lineWidth = 1.5;
+    ctx.stroke();
+
+    ctx.fillStyle = 'rgba(0,0,0,0.35)';
+    ctx.beginPath();
+    ctx.ellipse(player.x, kayakY - 12, 7, 9, 0, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.beginPath();
+    ctx.ellipse(player.x, kayakY + 12, 7, 9, 0, 0, Math.PI * 2);
+    ctx.fill();
+
+    ctx.strokeStyle = 'rgba(255,255,255,0.25)';
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    ctx.moveTo(player.x, kayakY - player.h / 2 - 8);
+    ctx.lineTo(player.x, kayakY - 20);
+    ctx.moveTo(player.x, kayakY - 4);
+    ctx.lineTo(player.x, kayakY + 4);
+    ctx.moveTo(player.x, kayakY + 20);
+    ctx.lineTo(player.x, kayakY + player.h / 2 + 8);
+    ctx.stroke();
+
+    ctx.globalAlpha = 1.0;
+    drawPaddler(0, player.paddlePhase, player.paddleAmp, false, -15);
+    drawPaddler(0, player.paddlePhase, player.paddleAmp, true, 15);
+  } else {
+    ctx.save();
+    ctx.translate(player.x, kayakY);
+    ctx.rotate(Math.PI / 4);
+    const grad = ctx.createLinearGradient(-player.w / 2, 0, player.w / 2, 0);
+    grad.addColorStop(0, '#7a1a00');
+    grad.addColorStop(0.5, '#CC3300');
+    grad.addColorStop(1, '#8a2200');
+    ctx.fillStyle = grad;
+    ctx.beginPath();
+    ctx.moveTo(0, -player.h / 2 - 10);
+    ctx.quadraticCurveTo(player.w / 2 + 5, -player.h / 4, player.w / 2, 0);
+    ctx.quadraticCurveTo(player.w / 2 + 5, player.h / 4, 0, player.h / 2 + 10);
+    ctx.quadraticCurveTo(-player.w / 2 - 5, player.h / 4, -player.w / 2, 0);
+    ctx.quadraticCurveTo(-player.w / 2 - 5, -player.h / 4, 0, -player.h / 2 - 10);
+    ctx.closePath();
+    ctx.fill();
+    ctx.strokeStyle = '#3a0a00';
+    ctx.lineWidth = 1.5;
+    ctx.stroke();
+    ctx.restore();
+    drawCapsizedPerson(player.x - 35, kayakY, false);
+    drawCapsizedPerson(player.x + 35, kayakY, true);
+  }
+}
+
+/* ---------- Strand-Szene bei Game Over ---------- */
+function drawBeachScene(kayakY) {
+  const side = player.beachSide || 'L';
+  const strandDx = side === 'L' ? -8 : 8;
+
+  // Personen + Feuer: fest am Welt-Ufer verankert (Position zur Game-Over-Zeit).
+  const anchorX = (player.beachAnchorX != null) ? player.beachAnchorX : player.x;
+  const anchorY = (player.beachAnchorY != null) ? player.beachAnchorY : player.y;
+  const shoreCX = anchorX + strandDx;
+  const shoreCY = (anchorY - camY) + 5;
+  const dir = side === 'L' ? -1 : 1;
+
+  // Spread in Flussrichtung, je Person eigene Shore-X anhand der Uferkante
+  // an ihrer eigenen y-Position — garantiert, dass keine Figur im Wasser landet.
+  const spread = 48;
+  const inland = 18;   // wie weit von der Wasserkante weg ins Land
+  const edgeMargin = 26;
+
+  // Funktion: Shore-X am gegebenen Welt-y für die gewählte Seite, clampt auf Screen.
+  const shoreXAt = wy => {
+    const [wL, wR] = waterEdges(wy);
+    const x = side === 'L' ? wL - inland : wR + inland;
+    return Math.max(edgeMargin, Math.min(WIDTH - edgeMargin, x));
+  };
+
+  // Person 1 (dunkelhaarig) — oberhalb des Feuers (flussaufwärts)
+  const p1WorldY = anchorY - spread;
+  const person1X = shoreXAt(p1WorldY);
+  const person1Y = p1WorldY - camY;
+  // Feuer in der Mitte
+  const fireX = shoreXAt(anchorY);
+  const fireY = shoreCY;
+  // Person 2 (blond) — unterhalb des Feuers (flussabwärts)
+  const p2WorldY = anchorY + spread;
+  const person2X = shoreXAt(p2WorldY);
+  const person2Y = p2WorldY - camY;
+
+  // Feuer zeichnen
+  ctx.save();
+  ctx.translate(fireX, fireY);
+  ctx.scale(2.6, 2.6);
+  drawBeachFire(0, 0);
+  ctx.restore();
+
+  // Person 1
+  ctx.save();
+  ctx.translate(person1X, person1Y);
+  ctx.scale(2.2, 2.2);
+  drawSittingPerson(0, 0, false, dir);
+  ctx.restore();
+
+  // Person 2
+  ctx.save();
+  ctx.translate(person2X, person2Y);
+  ctx.scale(2.2, 2.2);
+  drawSittingPerson(0, 0, true, dir);
+  ctx.restore();
+
+  // ---- Kajak (treibt wie ein Baumstamm, KEIN Schatten) ----
+  const kayakCX = player.x;
+  const kayakCY = player.y - camY;
+  const baseAngle = side === 'L' ? -Math.PI / 2.4 : Math.PI / 2.4;
+  const kayakAngle = baseAngle + (player.gameOverRot || 0);
+
+  ctx.save();
+  ctx.translate(kayakCX, kayakCY);
+  ctx.rotate(kayakAngle);
+
+  const grad = ctx.createLinearGradient(-player.w / 2, 0, player.w / 2, 0);
+  grad.addColorStop(0, '#7a1a00');
+  grad.addColorStop(0.5, '#CC3300');
+  grad.addColorStop(1, '#FF5A1F');
+  ctx.fillStyle = grad;
+  ctx.beginPath();
+  ctx.moveTo(0, -player.h / 2 - 10);
+  ctx.quadraticCurveTo(player.w / 2 + 5, -player.h / 4, player.w / 2, 0);
+  ctx.quadraticCurveTo(player.w / 2 + 5, player.h / 4, 0, player.h / 2 + 10);
+  ctx.quadraticCurveTo(-player.w / 2 - 5, player.h / 4, -player.w / 2, 0);
+  ctx.quadraticCurveTo(-player.w / 2 - 5, -player.h / 4, 0, -player.h / 2 - 10);
+  ctx.closePath();
+  ctx.fill();
+  ctx.strokeStyle = '#5a1200';
+  ctx.lineWidth = 1.5;
+  ctx.stroke();
+  ctx.fillStyle = 'rgba(0,0,0,0.4)';
+  ctx.beginPath(); ctx.ellipse(0, -12, 7, 9, 0, 0, Math.PI * 2); ctx.fill();
+  ctx.beginPath(); ctx.ellipse(0, 12, 7, 9, 0, 0, Math.PI * 2); ctx.fill();
+  ctx.restore();
+
+  // ---- Paddel (eigenständiger "Baumstamm", eigene Position + Rotation) ----
+  if (player.paddleY != null) {
+    const paddleCX = player.paddleX;
+    const paddleCY = player.paddleY - camY;
+    ctx.save();
+    ctx.translate(paddleCX, paddleCY);
+    ctx.rotate(player.paddleRot || 0);
+    ctx.strokeStyle = '#222';
+    ctx.lineWidth = 3;
+    ctx.beginPath();
+    ctx.moveTo(-30, 0); ctx.lineTo(30, 0);
+    ctx.stroke();
+    ctx.fillStyle = '#1a1a1a';
+    ctx.save();
+    ctx.translate(-30, 0);
+    ctx.beginPath();
+    ctx.ellipse(-6, 0, 7, 4, 0, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.restore();
+    ctx.save();
+    ctx.translate(30, 0);
+    ctx.beginPath();
+    ctx.ellipse(6, 0, 7, 4, 0, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.restore();
+    ctx.restore();
+  }
+}
+
+function drawSittingPerson(x, y, isBlond, facingDir) {
+  // facingDir: -1 = Personen schauen nach rechts (Richtung Wasser), +1 = nach links
+  const faceDir = -facingDir;
+  ctx.save();
+
+  // Körper (sitzend, angezogene Beine)
+  // Beine
+  ctx.fillStyle = '#2a4a7a'; // Badehose/Shorts
+  ctx.beginPath();
+  ctx.ellipse(x + faceDir * 6, y + 12, 10, 5, 0, 0, Math.PI * 2);
+  ctx.fill();
+  // Oberkörper schräg zurückgelehnt
+  ctx.fillStyle = isBlond ? '#ffb84a' : '#c44a1a';
+  ctx.save();
+  ctx.translate(x, y + 2);
+  ctx.rotate(faceDir * -0.15);
+  ctx.beginPath();
+  ctx.ellipse(0, 0, 6, 10, 0, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.restore();
+
+  // Arm mit Bier
+  ctx.strokeStyle = isBlond ? '#f5c080' : '#8b5a3c';
+  ctx.lineWidth = 3;
+  ctx.beginPath();
+  ctx.moveTo(x, y - 2);
+  ctx.lineTo(x + faceDir * 8, y - 8);
+  ctx.stroke();
+
+  // Bierflasche in der Hand
+  const bottleX = x + faceDir * 8;
+  const bottleY = y - 14;
+  // Flaschenkörper
+  ctx.fillStyle = '#3a5a2a';
+  ctx.fillRect(bottleX - 2.5, bottleY, 5, 10);
+  // Flaschenhals
+  ctx.fillRect(bottleX - 1.5, bottleY - 4, 3, 5);
+  // Etikett
+  ctx.fillStyle = '#f5d070';
+  ctx.fillRect(bottleX - 2.2, bottleY + 3, 4.4, 3);
+  // Glanz
+  ctx.fillStyle = 'rgba(255,255,255,0.4)';
+  ctx.fillRect(bottleX - 2, bottleY + 1, 1, 8);
+
+  // Kopf
+  ctx.fillStyle = '#f5c080';
+  ctx.beginPath();
+  ctx.arc(x, y - 10, 5, 0, Math.PI * 2);
+  ctx.fill();
+  // Haare
+  ctx.fillStyle = isBlond ? '#FFD700' : '#2a2a2a';
+  ctx.beginPath();
+  ctx.arc(x, y - 11, 5, Math.PI, 2 * Math.PI);
+  ctx.fill();
+  ctx.restore();
+}
+
+function drawBeachFire(x, y) {
+  // Steinkranz
+  ctx.fillStyle = '#5a5a5a';
+  for (let i = 0; i < 5; i++) {
+    const ang = (i / 5) * Math.PI * 2;
+    ctx.beginPath();
+    ctx.arc(x + Math.cos(ang) * 8, y + Math.sin(ang) * 3, 2.5, 0, Math.PI * 2);
+    ctx.fill();
+  }
+  // Holzscheite
+  ctx.strokeStyle = '#4a3020';
+  ctx.lineWidth = 2;
+  ctx.beginPath();
+  ctx.moveTo(x - 5, y + 1); ctx.lineTo(x + 5, y - 1);
+  ctx.moveTo(x - 4, y - 2); ctx.lineTo(x + 4, y + 2);
+  ctx.stroke();
+  // Flamme (animiert)
+  const flicker = Math.sin(tick * 0.3) * 2 + Math.sin(tick * 0.5) * 1;
+  ctx.fillStyle = '#ff8c1a';
+  ctx.beginPath();
+  ctx.moveTo(x, y - 10 - flicker);
+  ctx.quadraticCurveTo(x + 4, y - 2, x, y);
+  ctx.quadraticCurveTo(x - 4, y - 2, x, y - 10 - flicker);
+  ctx.fill();
+  ctx.fillStyle = '#ffd74a';
+  ctx.beginPath();
+  ctx.moveTo(x, y - 7 - flicker * 0.5);
+  ctx.quadraticCurveTo(x + 2, y - 1, x, y);
+  ctx.quadraticCurveTo(x - 2, y - 1, x, y - 7 - flicker * 0.5);
+  ctx.fill();
+}
+
+function drawSplashes() {
+  splashes.forEach(s => {
+    const alpha = s.life / s.maxLife;
+    const y = s.y - camY;
+    if (s.kind === 'ring') {
+      ctx.save();
+      ctx.strokeStyle = `rgba(220, 240, 255, ${alpha * 0.7})`;
+      ctx.lineWidth = 2;
+      ctx.beginPath();
+      ctx.ellipse(s.x, y, s.r * 1.3, s.r * 0.5, 0, 0, Math.PI * 2);
+      ctx.stroke();
+      ctx.restore();
+    } else if (s.kind === 'foam') {
+      ctx.fillStyle = `rgba(240, 250, 255, ${alpha * 0.85})`;
+      ctx.beginPath();
+      ctx.arc(s.x, y, s.r, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.fillStyle = `rgba(255, 255, 255, ${alpha})`;
+      ctx.beginPath();
+      ctx.arc(s.x - s.r * 0.3, y - s.r * 0.3, s.r * 0.5, 0, Math.PI * 2);
+      ctx.fill();
+    } else {
+      ctx.fillStyle = `rgba(180, 220, 250, ${alpha})`;
+      ctx.beginPath();
+      ctx.arc(s.x, y, s.r, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.fillStyle = `rgba(255, 255, 255, ${alpha * 0.8})`;
+      ctx.beginPath();
+      ctx.arc(s.x - s.r * 0.3, y - s.r * 0.3, s.r * 0.4, 0, Math.PI * 2);
+      ctx.fill();
+    }
+  });
+}
+
+function drawScorePops() {
+  scorePops.forEach(p => {
+    const age = tick - p.t;
+    const alpha = 1 - age / 60;
+    const y = p.y - camY - age * 0.8;
+    // Zeichenkette: numerisch bekommt '+', negativ/string (z.B. "-10", "Leben") direkt.
+    const label = typeof p.pts === 'number'
+      ? (p.pts >= 0 ? '+' + p.pts : String(p.pts))
+      : (String(p.pts).startsWith('-') ? String(p.pts) : '+' + p.pts);
+    const isPenalty = typeof p.pts === 'string' && p.pts.startsWith('-');
+    ctx.save();
+    ctx.globalAlpha = alpha;
+    ctx.fillStyle = isPenalty ? '#ff5a1a' : '#FFD700';
+    ctx.strokeStyle = '#000';
+    ctx.lineWidth = 3;
+    ctx.font = 'bold 22px Arial';
+    ctx.textAlign = 'center';
+    ctx.strokeText(label, p.x, y);
+    ctx.fillText(label, p.x, y);
+    ctx.restore();
+  });
+  ctx.textAlign = 'left';
+}
+
+function drawHUD() {
+  // Paddel-Lebensanzeige: schwarze Paddel, gut sichtbar, 3 feste Slots.
+  const MAX_LIVES = 3;
+  for (let i = 0; i < MAX_LIVES; i++) {
+    const x = 46 + i * 62;
+    const y = 36;
+    const active = i < lives;
+    ctx.save();
+    ctx.translate(x, y);
+    ctx.rotate(-Math.PI / 6);
+    ctx.globalAlpha = active ? 1.0 : 0.22;
+
+    // Stab
+    ctx.fillStyle = '#111';
+    ctx.strokeStyle = '#000';
+    ctx.lineWidth = 1.2;
+    ctx.beginPath();
+    ctx.roundRect(-24, -2.5, 48, 5, 2);
+    ctx.fill(); ctx.stroke();
+
+    // Blätter (links + rechts, schwarz, mit dezenter Kontur-Highlight)
+    ctx.fillStyle = '#000';
+    ctx.strokeStyle = '#1a1a1a';
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    ctx.moveTo(-24, -6);
+    ctx.quadraticCurveTo(-38, -7, -38, 0);
+    ctx.quadraticCurveTo(-38, 7, -24, 6);
+    ctx.closePath();
+    ctx.fill(); ctx.stroke();
+    ctx.beginPath();
+    ctx.moveTo(24, -6);
+    ctx.quadraticCurveTo(38, -7, 38, 0);
+    ctx.quadraticCurveTo(38, 7, 24, 6);
+    ctx.closePath();
+    ctx.fill(); ctx.stroke();
+    // Kontrast-Highlight
+    ctx.fillStyle = 'rgba(255,255,255,0.2)';
+    ctx.beginPath();
+    ctx.ellipse(-31, -2, 3, 1.4, 0, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.beginPath();
+    ctx.ellipse(31, -2, 3, 1.4, 0, 0, Math.PI * 2);
+    ctx.fill();
+
+    // Griff-Wicklungen
+    ctx.strokeStyle = 'rgba(255,255,255,0.25)';
+    ctx.lineWidth = 0.9;
+    ctx.beginPath();
+    ctx.moveTo(-18, -2.5); ctx.lineTo(-18, 2.5);
+    ctx.moveTo(-15, -2.5); ctx.lineTo(-15, 2.5);
+    ctx.moveTo(15, -2.5); ctx.lineTo(15, 2.5);
+    ctx.moveTo(18, -2.5); ctx.lineTo(18, 2.5);
+    ctx.stroke();
+
+    ctx.globalAlpha = 1.0;
+    ctx.restore();
+  }
+
+  // Punkte & Distanz: bei GameOver im oberen Banner highlighten, sonst normale Anzeige.
+  if (!gameOver) {
+    ctx.fillStyle = '#000';
+    ctx.font = 'bold 24px Arial';
+    ctx.textAlign = 'right';
+    ctx.fillText('Punkte: ' + score, WIDTH - 20, 40);
+    ctx.font = 'bold 14px Arial';
+    ctx.fillText('Distanz: ' + Math.floor(distance), WIDTH - 20, 60);
+
+    // Level-Plakette oben rechts — Farbe entspricht der Strömungsstärke (4 Stufen).
+    const level = score < 30 ? 1 : score < 60 ? 2 : score < 90 ? 3 : 4;
+    const levelCol = level === 1 ? '#3a7a3a'     // grün: ruhig
+                   : level === 2 ? '#2e5f8a'     // blau: normal
+                   : level === 3 ? '#c44a1a'     // orange: stark
+                   :               '#6a1a3a';    // dunkelrot: sehr stark
+    ctx.save();
+    ctx.fillStyle = levelCol;
+    ctx.fillRect(WIDTH - 100, 72, 80, 24);
+    ctx.strokeStyle = '#000';
+    ctx.lineWidth = 1.2;
+    ctx.strokeRect(WIDTH - 100, 72, 80, 24);
+    ctx.fillStyle = '#fff';
+    ctx.textAlign = 'center';
+    ctx.font = 'bold 14px Arial';
+    ctx.textBaseline = 'middle';
+    ctx.fillText('Level ' + level, WIDTH - 60, 84);
+    ctx.restore();
+    ctx.textAlign = 'left';
+    ctx.textBaseline = 'alphabetic';
+  }
+
+  // Ton-Button als Lautsprecher-Icon am unteren Rand (Taste M weiterhin aktiv).
+  ctx.save();
+  const btnX = WIDTH / 2 - 22, btnY = HEIGHT - 44, btnW = 44, btnH = 36;
+  // Knopf-Hintergrund
+  ctx.fillStyle = soundMuted ? 'rgba(196, 74, 26, 0.92)' : 'rgba(46, 95, 138, 0.92)';
+  ctx.beginPath();
+  const r = 6;
+  ctx.moveTo(btnX + r, btnY);
+  ctx.lineTo(btnX + btnW - r, btnY);
+  ctx.quadraticCurveTo(btnX + btnW, btnY, btnX + btnW, btnY + r);
+  ctx.lineTo(btnX + btnW, btnY + btnH - r);
+  ctx.quadraticCurveTo(btnX + btnW, btnY + btnH, btnX + btnW - r, btnY + btnH);
+  ctx.lineTo(btnX + r, btnY + btnH);
+  ctx.quadraticCurveTo(btnX, btnY + btnH, btnX, btnY + btnH - r);
+  ctx.lineTo(btnX, btnY + r);
+  ctx.quadraticCurveTo(btnX, btnY, btnX + r, btnY);
+  ctx.closePath();
+  ctx.fill();
+  ctx.strokeStyle = '#000';
+  ctx.lineWidth = 1.5;
+  ctx.stroke();
+
+  // Lautsprecher-Icon: Box + Kegel
+  const cX = btnX + btnW / 2;
+  const cY = btnY + btnH / 2;
+  ctx.fillStyle = '#fff';
+  ctx.strokeStyle = '#fff';
+  ctx.lineWidth = 2;
+  ctx.lineJoin = 'round';
+  ctx.beginPath();
+  // Speaker-Box (Quadrat links) + Kegel (Trapez rechts)
+  ctx.moveTo(cX - 10, cY - 4);
+  ctx.lineTo(cX - 4, cY - 4);
+  ctx.lineTo(cX + 4, cY - 10);
+  ctx.lineTo(cX + 4, cY + 10);
+  ctx.lineTo(cX - 4, cY + 4);
+  ctx.lineTo(cX - 10, cY + 4);
+  ctx.closePath();
+  ctx.fill();
+
+  if (soundMuted) {
+    // Roter Schrägstrich durch den Lautsprecher
+    ctx.strokeStyle = '#ff3030';
+    ctx.lineWidth = 3;
+    ctx.lineCap = 'round';
+    ctx.beginPath();
+    ctx.moveTo(cX - 12, cY - 12);
+    ctx.lineTo(cX + 12, cY + 12);
+    ctx.stroke();
+  } else {
+    // Schallwellen
+    ctx.strokeStyle = '#fff';
+    ctx.lineWidth = 1.6;
+    ctx.lineCap = 'round';
+    ctx.beginPath();
+    ctx.arc(cX + 6, cY, 4, -Math.PI / 4, Math.PI / 4);
+    ctx.stroke();
+    ctx.beginPath();
+    ctx.arc(cX + 6, cY, 8, -Math.PI / 4, Math.PI / 4);
+    ctx.stroke();
+  }
+  ctx.restore();
+
+  // Geheimzahlen aus dem Original: bei 40 / 80 / 120 Punkten erscheinen
+  // 3, 2, 4 als grosse goldene Ziffern unten mittig nebeneinander.
+  ctx.save();
+  ctx.font = 'bold 72px Arial';
+  ctx.fillStyle = '#FFD700';
+  ctx.textAlign = 'center';
+  ctx.shadowColor = '#000';
+  ctx.shadowBlur = 4;
+  ctx.shadowOffsetX = 2;
+  ctx.shadowOffsetY = 2;
+  const secretY = HEIGHT - 50;
+  const secretX = WIDTH / 2 - 80;
+  // Fanfare, sobald eine Schwelle (30 / 60 / 90) neu erreicht wird.
+  const reached = (score >= 90) ? 3 : (score >= 60) ? 2 : (score >= 30) ? 1 : 0;
+  if (reached > secretsRevealed) {
+    secretsRevealed = reached;
+    playFanfare();
+  }
+  if (score >= 30) ctx.fillText('3', secretX,       secretY);
+  if (score >= 60) ctx.fillText('2', secretX +  80, secretY);
+  if (score >= 90) ctx.fillText('4', secretX + 160, secretY);
+  ctx.restore();
+
+  ctx.textAlign = 'left';
+
+  if (gameOver) {
+    // Banner ganz oben: GAME OVER + Punkte & Distanz highlighted.
+    ctx.save();
+    ctx.fillStyle = 'rgba(0, 0, 0, 0.72)';
+    ctx.fillRect(0, 0, WIDTH, 82);
+    ctx.textAlign = 'center';
+    ctx.fillStyle = '#FFD700';
+    ctx.font = '900 30px "Arial Black", Impact, sans-serif';
+    ctx.fillText('GAME OVER', WIDTH / 2, 34);
+    ctx.fillStyle = '#FFF';
+    ctx.font = 'bold 18px Arial';
+    ctx.fillText('Punkte: ' + score + '   •   Distanz: ' + Math.floor(distance), WIDTH / 2, 64);
+    ctx.restore();
+
+    // Hinweis unten (Neustart)
+    ctx.fillStyle = 'rgba(0, 0, 0, 0.6)';
+    ctx.fillRect(0, HEIGHT - 34, WIDTH, 34);
+    ctx.fillStyle = '#FFF';
+    ctx.font = '13px Arial';
+    ctx.textAlign = 'center';
+    ctx.fillText('Klick oder Tipp für Neustart', WIDTH / 2, HEIGHT - 12);
+    ctx.textAlign = 'left';
+  }
+}
+
+function drawWater() {
+  // Glatte Wasser-Silhouette als geschlossenes Polygon, 1-Pixel-Abtastung.
+  ctx.save();
+  ctx.beginPath();
+  for (let y = 0; y <= HEIGHT; y += 1) {
+    const [L] = waterEdges(y + camY);
+    if (y === 0) ctx.moveTo(L, y);
+    else ctx.lineTo(L, y);
+  }
+  for (let y = HEIGHT; y >= 0; y -= 1) {
+    const [, R] = waterEdges(y + camY);
+    ctx.lineTo(R, y);
+  }
+  ctx.closePath();
+  ctx.clip();
+
+  // Ein einziger vertikaler Gradient. Die Zonenfarbe wird stetig aus dem
+  // flowMultiplier interpoliert — keine harten Schwellen, daher kein Banding.
+  // Zonenfarben bewusst stärker voneinander getrennt: ruhig = helles Türkis,
+  // normal = klares Blau, Stromschnelle = dunkles, kühles Graublau.
+  const CALM   = [110, 185, 195];
+  const NORMAL = [ 50, 115, 210];
+  const RAPID  = [ 30,  60,  95];
+  const mix = (a, b, k) => [
+    a[0] + (b[0] - a[0]) * k,
+    a[1] + (b[1] - a[1]) * k,
+    a[2] + (b[2] - a[2]) * k
+  ];
+  const zoneColor = (m) => {
+    if (m <= 1.0) {
+      const k = Math.max(0, Math.min(1, (m - 0.4) / 0.6));
+      return mix(CALM, NORMAL, k);
+    }
+    const k = Math.max(0, Math.min(1, (m - 1.0) / 0.6));
+    return mix(NORMAL, RAPID, k);
+  };
+
+  // Gradient ausschliesslich aus der Zonenfarbe — kein Screen-space-Darkening mehr,
+  // damit die Wasserdarstellung unabhängig von der Bewegungsrichtung wirkt.
+  const grad = ctx.createLinearGradient(0, 0, 0, HEIGHT);
+  const steps = 16;
+  for (let i = 0; i <= steps; i++) {
+    const t = i / steps;
+    const worldY = t * HEIGHT + camY;
+    // Effektive Zone berücksichtigt die Level-Stufe, damit im schnellen Level
+    // sogar die ruhigen Abschnitte dunkler/turbulenter wirken — Optik passt zum Tempo.
+    const m = flowMultiplier(worldY) * difficulty;
+    const col = zoneColor(m);
+    grad.addColorStop(t, `rgb(${Math.round(col[0])},${Math.round(col[1])},${Math.round(col[2])})`);
+  }
+  ctx.fillStyle = grad;
+  ctx.fillRect(0, 0, WIDTH, HEIGHT);
+
+  const highlight = ctx.createLinearGradient(0, 0, 0, HEIGHT * 0.25);
+  highlight.addColorStop(0, 'rgba(255,255,255,0.08)');
+  highlight.addColorStop(1, 'rgba(255,255,255,0)');
+  ctx.fillStyle = highlight;
+  ctx.fillRect(0, 0, WIDTH, HEIGHT * 0.25);
+
+  ctx.restore();
+}
+
+function drawWaves() {
+  // Clip entlang der Wasserkante, 1-Pixel-Abtastung.
+  ctx.save();
+  ctx.beginPath();
+  for (let y = 0; y <= HEIGHT; y += 1) {
+    const [L] = waterEdges(y + camY);
+    if (y === 0) ctx.moveTo(L, y);
+    else ctx.lineTo(L, y);
+  }
+  for (let y = HEIGHT; y >= 0; y -= 1) {
+    const [, R] = waterEdges(y + camY);
+    ctx.lineTo(R, y);
+  }
+  ctx.closePath();
+  ctx.clip();
+
+  // Wellen an WELT-Y verankert, damit sie bei Bewegung sauber mitscrollen
+  // und das Bild der Strömung nicht zwischen Vor-/Rückfahrt wechselt.
+  const rowStep = 15;
+  const rowStart = Math.floor(camY / rowStep) * rowStep;
+  for (let wy = rowStart - rowStep; wy < camY + HEIGHT + rowStep; wy += rowStep) {
+    const y = wy - camY;
+    if (y < -rowStep || y > HEIGHT + rowStep) continue;
+    const [L, R] = waterEdges(wy);
+    // Optik = Zone × Level-Tempo, damit Wellenintensität zur Geschwindigkeit passt.
+    const m = flowMultiplier(wy) * difficulty;
+
+    // Wellenlinien: stärker + heller in Stromschnellen. Phase aus WELT-Koordinaten.
+    if (m > 0.5) {
+      ctx.lineWidth = 0.7 + m * 0.6;
+      const alpha = Math.min(0.75, 0.12 + (m - 0.5) * 0.55);
+      ctx.strokeStyle = `rgba(255, 255, 255, ${alpha})`;
+      const waveOffset = Math.sin(tick * 0.02 * m + wy * 0.1) * 5 * m;
+      ctx.beginPath();
+      ctx.moveTo(L + 3, y);
+      for (let x = L + 3; x <= R - 3; x += 10) {
+        const waveY = y + Math.sin(x * 0.05 + tick * 0.03 * m) * 4 * m;
+        const safeX = Math.max(L + 3, Math.min(R - 3, x + waveOffset));
+        ctx.lineTo(safeX, waveY);
+      }
+      ctx.stroke();
+    }
+
+    // Schaum in Stromschnellen — Positionen aus wy, damit sie world-anchored scrollen.
+    if (m > 1.2) {
+      const density = Math.floor((m - 1.1) * 24);
+      for (let i = 0; i < density; i++) {
+        const span = Math.max(1, R - L - 10);
+        const fx = L + 5 + Math.abs(Math.sin(wy * 0.31 + i * 7.3)) * span;
+        const fy = y + ((wy * 5 + i * 13) % rowStep);
+        const alpha = 0.55 + Math.sin(tick * 0.1 + i + wy * 0.05) * 0.35;
+        ctx.fillStyle = `rgba(255,255,255,${alpha})`;
+        ctx.beginPath();
+        ctx.arc(fx, fy, 2.2 + Math.sin(tick * 0.2 + i + wy * 0.07) * 1.2, 0, Math.PI * 2);
+        ctx.fill();
+      }
+      // Weisse Brecher-Kämme
+      ctx.strokeStyle = 'rgba(255,255,255,0.45)';
+      ctx.lineWidth = 1.4;
+      ctx.beginPath();
+      ctx.moveTo(L + 10, y + 8);
+      for (let x = L + 10; x < R - 10; x += 8) {
+        ctx.lineTo(x + 4, y + 8 + Math.sin(x * 0.2 + tick * 0.25 + wy * 0.03) * 3);
+      }
+      ctx.stroke();
+    }
+
+    // Ruhige Zone: feine Reflexionslinien.
+    if (m < 0.75) {
+      ctx.strokeStyle = `rgba(255,255,255,${0.22 - m * 0.1})`;
+      ctx.lineWidth = 0.8;
+      ctx.beginPath();
+      ctx.moveTo(L + 24, y + 5);
+      ctx.lineTo(R - 24, y + 5);
+      ctx.stroke();
+      ctx.beginPath();
+      ctx.moveTo(L + 40, y + 10);
+      ctx.lineTo(R - 40, y + 10);
+      ctx.stroke();
+    }
+  }
+  ctx.restore();
+}
+
+function drawBanks() {
+  // Baut einen Ufer-Polygonpfad mit 1-Pixel-Abtastung.
+  function bankPath(side, innerOffset, outerOffset, wobbleFn) {
+    const mult = side === 'L' ? -1 : 1;
+    ctx.beginPath();
+    for (let y = 0; y <= HEIGHT; y += 1) {
+      const edges = waterEdges(y + camY);
+      const edge = side === 'L' ? edges[0] : edges[1];
+      const x = edge + mult * innerOffset;
+      if (y === 0) ctx.moveTo(x, y);
+      else ctx.lineTo(x, y);
+    }
+    for (let y = HEIGHT; y >= 0; y -= 1) {
+      const edges = waterEdges(y + camY);
+      const edge = side === 'L' ? edges[0] : edges[1];
+      const wob = wobbleFn ? wobbleFn(y + camY, side) : 0;
+      const x = edge + mult * (outerOffset + wob);
+      ctx.lineTo(x, y);
+    }
+    ctx.closePath();
+  }
+
+  // Schicht 1: Dunkler Waldboden — alles ausserhalb des Wassers.
+  ctx.fillStyle = '#2a5a35';
+  ctx.beginPath();
+  ctx.moveTo(0, 0);
+  for (let y = 0; y <= HEIGHT; y += 1) {
+    const [L] = waterEdges(y + camY);
+    ctx.lineTo(L, y);
+  }
+  ctx.lineTo(0, HEIGHT);
+  ctx.closePath();
+  ctx.fill();
+
+  ctx.beginPath();
+  ctx.moveTo(WIDTH, 0);
+  for (let y = 0; y <= HEIGHT; y += 1) {
+    const [, R] = waterEdges(y + camY);
+    ctx.lineTo(R, y);
+  }
+  ctx.lineTo(WIDTH, HEIGHT);
+  ctx.closePath();
+  ctx.fill();
+
+  // Schicht 2: Hellere Graszone
+  ctx.fillStyle = '#4a9a4a';
+  const grassWobbleL = (wy) => Math.sin(wy * 0.02) * 8;
+  const grassWobbleR = (wy) => Math.sin(wy * 0.023 + 1.7) * 8;
+  bankPath('L', 0, 55, grassWobbleL);
+  ctx.fill();
+  bankPath('R', 0, 55, grassWobbleR);
+  ctx.fill();
+
+  // Übergang Gras → hellerer Farbton
+  ctx.fillStyle = 'rgba(255, 230, 130, 0.15)';
+  bankPath('L', 10, 35, grassWobbleL);
+  ctx.fill();
+  bankPath('R', 10, 35, grassWobbleR);
+  ctx.fill();
+
+  // Schicht 3: Sandige/kiesige Uferzone
+  ctx.fillStyle = '#c9b284';
+  const sandWobbleL = (wy) => Math.sin(wy * 0.07) * 3 + Math.sin(wy * 0.15 + 0.5) * 2;
+  const sandWobbleR = (wy) => Math.sin(wy * 0.08 + 2.1) * 3 + Math.sin(wy * 0.17) * 2;
+  bankPath('L', 0, 10, sandWobbleL);
+  ctx.fill();
+  bankPath('R', 0, 10, sandWobbleR);
+  ctx.fill();
+
+  // Schicht 4: Feuchter, dunklerer Saum direkt am Wasser
+  ctx.fillStyle = 'rgba(100, 80, 55, 0.55)';
+  const wetWobbleL = (wy) => Math.sin(wy * 0.12) * 1.5;
+  const wetWobbleR = (wy) => Math.sin(wy * 0.13 + 1.2) * 1.5;
+  bankPath('L', 0, 3, wetWobbleL);
+  ctx.fill();
+  bankPath('R', 0, 3, wetWobbleR);
+  ctx.fill();
+
+  // Detail: kleine Kieselsteine — an 25-px-Grid ausgerichtet, damit sie bei
+  // kontinuierlichem Scroll nicht springen/flimmern.
+  const pebbleStep = 25;
+  const pebbleRow = Math.floor(camY / pebbleStep) * pebbleStep - pebbleStep;
+  for (let wy = pebbleRow; wy < camY + HEIGHT + pebbleStep; wy += pebbleStep) {
+    const screenY = wy - camY;
+    if (screenY < -10 || screenY > HEIGHT + 10) continue;
+    const [L, R] = waterEdges(wy);
+    for (let j = 0; j < 3; j++) {
+      const hashL = Math.abs(Math.sin(wy * 0.31 + j * 7.3)) % 1;
+      const hashR = Math.abs(Math.sin(wy * 0.27 + j * 9.1 + 3.2)) % 1;
+      const px = L - 4 - hashL * 8;
+      const pxR = R + 4 + hashR * 8;
+      const psize = 1 + hashL * 1.5;
+      ctx.fillStyle = 'rgba(100, 85, 60, 0.6)';
+      ctx.beginPath();
+      ctx.arc(px, screenY, psize, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.beginPath();
+      ctx.arc(pxR, screenY, psize, 0, Math.PI * 2);
+      ctx.fill();
+    }
+  }
+
+  // Detail: Grasbüschel — eigenes 18-px-Grid, damit ihre Welt-Positionen
+  // stabil sind und sie nicht beim Kameraschub aufblinken.
+  const grassStep = 18;
+  const grassRow = Math.floor(camY / grassStep) * grassStep - grassStep;
+  for (let wy = grassRow; wy < camY + HEIGHT + grassStep; wy += grassStep) {
+    const screenY = wy - camY;
+    if (screenY < -5 || screenY > HEIGHT + 5) continue;
+    const [L, R] = waterEdges(wy);
+    const hashL = Math.abs(Math.sin(wy * 0.19)) % 1;
+    const hashR = Math.abs(Math.sin(wy * 0.23 + 2.5)) % 1;
+    if (hashL > 0.3) {
+      const gx = L - 15 - hashL * 6;
+      drawGrassTuft(gx, screenY);
+    }
+    if (hashR > 0.3) {
+      const gx = R + 15 + hashR * 6;
+      drawGrassTuft(gx, screenY);
+    }
+  }
+}
+
+function drawGrassTuft(x, y) {
+  ctx.strokeStyle = '#2e7030';
+  ctx.lineWidth = 1;
+  ctx.beginPath();
+  ctx.moveTo(x - 2, y + 2); ctx.lineTo(x - 2, y - 3);
+  ctx.moveTo(x, y + 2); ctx.lineTo(x, y - 4);
+  ctx.moveTo(x + 2, y + 2); ctx.lineTo(x + 2, y - 3);
+  ctx.stroke();
+  ctx.strokeStyle = '#4aa04a';
+  ctx.beginPath();
+  ctx.moveTo(x - 1, y + 2); ctx.lineTo(x - 1, y - 2);
+  ctx.moveTo(x + 1, y + 2); ctx.lineTo(x + 1, y - 2);
+  ctx.stroke();
+}
+
+function drawFish(fish) {
+  // Als Delfin gezeichnet: streamlined, zweifarbig (oben grau-blau, unten hell),
+  // mit Rückenflosse, Brustflosse und Schwanzfluke. Zentriert um (0, 0).
+  const x = fish.x;
+  const y = fish.y - camY;
+  const scale = 0.4;
+  ctx.save();
+  ctx.translate(x, y);
+  ctx.scale(scale, scale);
+  if (player.x - fish.x < 0) ctx.scale(-1, 1);
+
+  // Schwanz-Fluke
+  ctx.fillStyle = '#2e4f68';
+  ctx.strokeStyle = '#13253a';
+  ctx.lineWidth = 2.5;
+  ctx.beginPath();
+  ctx.moveTo(55, 0);
+  ctx.lineTo(82, -18);
+  ctx.quadraticCurveTo(72, 0, 82, 18);
+  ctx.closePath();
+  ctx.fill(); ctx.stroke();
+
+  // Delfin-Körper mit Zwei-Ton-Gradient (oben grau-blau, unten hell)
+  const bodyGrad = ctx.createLinearGradient(0, -22, 0, 22);
+  bodyGrad.addColorStop(0, '#4a6e86');
+  bodyGrad.addColorStop(0.45, '#7f9cae');
+  bodyGrad.addColorStop(0.55, '#e8ecef');
+  bodyGrad.addColorStop(1, '#c8d0d4');
+  ctx.fillStyle = bodyGrad;
+  ctx.strokeStyle = '#13253a';
+  ctx.lineWidth = 2.5;
+  ctx.beginPath();
+  ctx.moveTo(-72, 2);                          // Schnauzenspitze
+  ctx.quadraticCurveTo(-62, -10, -48, -14);    // Melone/Stirn
+  ctx.quadraticCurveTo(-30, -20, -10, -20);    // Rücken vor Flosse
+  ctx.quadraticCurveTo(15, -18, 35, -13);      // Rücken hinter Flosse
+  ctx.quadraticCurveTo(50, -10, 58, -4);       // Schwanzansatz oben
+  ctx.quadraticCurveTo(55, 0, 58, 4);          // Schwanzkerbe
+  ctx.quadraticCurveTo(50, 10, 35, 13);        // Schwanzansatz unten
+  ctx.quadraticCurveTo(10, 19, -20, 19);       // Bauch
+  ctx.quadraticCurveTo(-50, 16, -64, 10);      // unter der Melone
+  ctx.quadraticCurveTo(-72, 8, -72, 2);        // zurück zur Schnauze
+  ctx.closePath();
+  ctx.fill(); ctx.stroke();
+
+  // Rückenflosse (gebogen nach hinten)
+  ctx.fillStyle = '#2e4f68';
+  ctx.beginPath();
+  ctx.moveTo(-5, -19);
+  ctx.quadraticCurveTo(5, -36, 18, -18);
+  ctx.closePath();
+  ctx.fill(); ctx.stroke();
+
+  // Brustflosse (pectoral)
+  ctx.fillStyle = '#2e4f68';
+  ctx.beginPath();
+  ctx.moveTo(-32, 8);
+  ctx.quadraticCurveTo(-30, 22, -16, 22);
+  ctx.quadraticCurveTo(-20, 14, -22, 10);
+  ctx.closePath();
+  ctx.fill(); ctx.stroke();
+
+  // Maul-Linie (Schnabel/Rostrum)
+  ctx.strokeStyle = '#13253a';
+  ctx.lineWidth = 1.5;
+  ctx.beginPath();
+  ctx.moveTo(-70, 6);
+  ctx.quadraticCurveTo(-62, 9, -48, 7);
+  ctx.stroke();
+
+  // Zwei-Ton-Trennlinie (schwaches Highlight)
+  ctx.strokeStyle = 'rgba(255,255,255,0.35)';
+  ctx.lineWidth = 1;
+  ctx.beginPath();
+  ctx.moveTo(-60, 2);
+  ctx.quadraticCurveTo(-20, 4, 40, 3);
+  ctx.stroke();
+
+  // Auge
+  ctx.fillStyle = '#000';
+  ctx.beginPath();
+  ctx.arc(-48, -6, 2.8, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.fillStyle = '#fff';
+  ctx.beginPath();
+  ctx.arc(-49, -7, 1, 0, Math.PI * 2);
+  ctx.fill();
+
+  ctx.restore();
+}
+
+function drawFisherman(fisherman) {
+  const y = fisherman.y - camY;
+  if (y < -200 || y > HEIGHT + 100) return;
+  const [L, R] = waterEdges(fisherman.y);
+  // Fischer muss IMMER ausserhalb des Wassers stehen. Mindestabstand 15 px
+  // zur Uferkante; falls das Ufer so nah am Screen-Rand ist, dass der Fischer
+  // zwischen Wasser und Bildschirmrand gequetscht wäre, lieber gar nicht zeichnen.
+  const edgeGap = 15;
+  let adjustedX;
+  if (fisherman.side === 'L') {
+    const desired = L - 40;
+    adjustedX = Math.max(20, desired);
+    if (adjustedX > L - edgeGap) return;
+  } else {
+    const desired = R + 40;
+    adjustedX = Math.min(WIDTH - 20, desired);
+    if (adjustedX < R + edgeGap) return;
+  }
+
+  // Flash-Effekt: nach Berührung für 3 Sekunden gold pulsierend.
+  const flashDuration = 180;
+  const isFlashing = fisherman.touched && (tick - fisherman.flashTime < flashDuration);
+  const flashIntensity = isFlashing ? Math.abs(Math.sin((tick - fisherman.flashTime) * 0.15)) : 0;
+  const flashOn = isFlashing && flashIntensity > 0.5;
+
+  const scale = 0.4;
+  ctx.save();
+  ctx.translate(adjustedX, y);
+  ctx.scale(scale, scale);
+  if (fisherman.side === 'R') ctx.scale(-1, 1);
+
+  // Beine (Hose)
+  ctx.fillStyle = '#2f4a6a';
+  ctx.strokeStyle = '#1a2b3f';
+  ctx.lineWidth = 2;
+  ctx.beginPath();
+  ctx.moveTo(-18, 60); ctx.lineTo(-12, 60);
+  ctx.lineTo(-28, 140); ctx.lineTo(-40, 138);
+  ctx.closePath();
+  ctx.fill(); ctx.stroke();
+  ctx.beginPath();
+  ctx.moveTo(12, 60); ctx.lineTo(18, 60);
+  ctx.lineTo(32, 138); ctx.lineTo(20, 140);
+  ctx.closePath();
+  ctx.fill(); ctx.stroke();
+
+  // Stiefel
+  ctx.fillStyle = '#2a1a0f';
+  ctx.beginPath(); ctx.ellipse(-34, 142, 12, 5, 0, 0, Math.PI * 2); ctx.fill();
+  ctx.beginPath(); ctx.ellipse(26, 142, 12, 5, 0, 0, Math.PI * 2); ctx.fill();
+
+  // Oberkörper (T-Shirt / Weste)
+  const shirtGrad = ctx.createLinearGradient(-24, -30, 24, 60);
+  shirtGrad.addColorStop(0, '#6d8f3c');
+  shirtGrad.addColorStop(1, '#3c5a1e');
+  ctx.fillStyle = shirtGrad;
+  ctx.strokeStyle = '#28400f';
+  ctx.lineWidth = 2;
+  ctx.beginPath();
+  ctx.moveTo(-24, -28);
+  ctx.quadraticCurveTo(-28, 30, -20, 62);
+  ctx.lineTo(20, 62);
+  ctx.quadraticCurveTo(28, 30, 24, -28);
+  ctx.quadraticCurveTo(0, -32, -24, -28);
+  ctx.closePath();
+  ctx.fill(); ctx.stroke();
+
+  // Arme (Haut)
+  ctx.fillStyle = '#e8b58a';
+  ctx.strokeStyle = '#8f6238';
+  ctx.lineWidth = 2;
+  // linker Arm hängt
+  ctx.beginPath();
+  ctx.moveTo(-22, -10);
+  ctx.quadraticCurveTo(-40, 10, -36, 34);
+  ctx.lineTo(-28, 34);
+  ctx.quadraticCurveTo(-32, 10, -14, -10);
+  ctx.closePath();
+  ctx.fill(); ctx.stroke();
+  // rechter Arm hält Rute
+  ctx.beginPath();
+  ctx.moveTo(14, -10);
+  ctx.quadraticCurveTo(36, 4, 44, 22);
+  ctx.lineTo(36, 28);
+  ctx.quadraticCurveTo(30, 10, 22, -10);
+  ctx.closePath();
+  ctx.fill(); ctx.stroke();
+
+  // Hals
+  ctx.fillStyle = '#e8b58a';
+  ctx.fillRect(-5, -36, 10, 10);
+
+  // Kopf — bei Flash rot pulsierend, sonst Hautfarbe.
+  if (flashOn) {
+    ctx.shadowColor = '#ff2020';
+    ctx.shadowBlur = 18;
+    ctx.fillStyle = '#e52020';
+    ctx.strokeStyle = '#7a0a0a';
+  } else {
+    ctx.fillStyle = '#e8b58a';
+    ctx.strokeStyle = '#8f6238';
+  }
+  ctx.lineWidth = 2;
+  ctx.beginPath(); ctx.arc(0, -50, 15, 0, Math.PI * 2);
+  ctx.fill(); ctx.stroke();
+  if (flashOn) ctx.shadowBlur = 0;
+
+  // Bart (Fischer-Charakter)
+  ctx.fillStyle = '#c0c0c0';
+  ctx.beginPath();
+  ctx.ellipse(0, -42, 10, 6, 0, 0, Math.PI);
+  ctx.fill();
+
+  // Hut mit Krempe
+  ctx.fillStyle = '#5a3b1c';
+  ctx.strokeStyle = '#2e1e0a';
+  ctx.lineWidth = 2;
+  ctx.beginPath();
+  ctx.ellipse(0, -61, 22, 4, 0, 0, Math.PI * 2);
+  ctx.fill(); ctx.stroke();
+  ctx.beginPath();
+  ctx.moveTo(-12, -61);
+  ctx.quadraticCurveTo(-14, -78, 0, -78);
+  ctx.quadraticCurveTo(14, -78, 12, -61);
+  ctx.closePath();
+  ctx.fill(); ctx.stroke();
+  ctx.fillStyle = '#3a2410';
+  ctx.fillRect(-12, -64, 24, 2);
+
+  if (fisherman.rodInWater) {
+    // Rute ins Wasser geschwungen, mit Schnur und Schwimmer.
+    const rodGrad = ctx.createLinearGradient(40, 20, 410, 80);
+    rodGrad.addColorStop(0, '#6b4528');
+    rodGrad.addColorStop(1, '#b88a5a');
+    ctx.strokeStyle = rodGrad;
+    ctx.lineWidth = 4;
+    ctx.lineCap = 'round';
+    ctx.beginPath();
+    ctx.moveTo(40, 20);
+    ctx.quadraticCurveTo(190, -40, 410, 80);
+    ctx.stroke();
+
+    // Angelschnur
+    ctx.strokeStyle = 'rgba(80,80,80,0.85)';
+    ctx.lineWidth = 1.5;
+    ctx.beginPath();
+    ctx.moveTo(410, 80);
+    ctx.quadraticCurveTo(460, 160, 410, 240);
+    ctx.stroke();
+
+    // Schwimmer (Bobber)
+    ctx.fillStyle = '#d63a1a';
+    ctx.strokeStyle = '#3a0f04';
+    ctx.lineWidth = 1.5;
+    ctx.beginPath();
+    ctx.ellipse(410, 240, 10, 16, Math.PI / 8, 0, Math.PI * 2);
+    ctx.fill(); ctx.stroke();
+    ctx.save();
+    ctx.beginPath();
+    ctx.ellipse(410, 240, 10, 16, Math.PI / 8, 0, Math.PI * 2);
+    ctx.clip();
+    ctx.fillStyle = '#fafafa';
+    ctx.fillRect(395, 240, 40, 20);
+    ctx.restore();
+    ctx.strokeStyle = '#2a1a0f';
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    ctx.moveTo(405, 225); ctx.lineTo(402, 215);
+    ctx.stroke();
+  } else {
+    // Rute am Ufer hochgehalten / geschultert — keine Schnur im Wasser.
+    const rodGrad = ctx.createLinearGradient(40, 20, 260, -220);
+    rodGrad.addColorStop(0, '#6b4528');
+    rodGrad.addColorStop(1, '#b88a5a');
+    ctx.strokeStyle = rodGrad;
+    ctx.lineWidth = 4;
+    ctx.lineCap = 'round';
+    ctx.beginPath();
+    ctx.moveTo(40, 20);
+    ctx.quadraticCurveTo(160, -100, 260, -220);
+    ctx.stroke();
+    // Aufgewickelte Schnur an der Rutenspitze
+    ctx.strokeStyle = 'rgba(80,80,80,0.7)';
+    ctx.lineWidth = 1.2;
+    ctx.beginPath();
+    for (let i = 0; i < 4; i++) {
+      ctx.moveTo(260, -220 + i * 3);
+      ctx.lineTo(275, -218 + i * 3);
+    }
+    ctx.stroke();
+  }
+
+  ctx.restore();
+}
+
+function drawPoliceBoat(boat) {
+  const x = boat.x;
+  const yWater = boat.y - camY;
+  const jumpOff = boat.jumpOffset || 0;
+  const y = yWater - jumpOff;  // hebt das Boot beim Sprung nach oben auf dem Bildschirm
+
+  // Wasserschatten bleibt unten, wächst flacher wenn das Boot fliegt
+  if (jumpOff > 0.5) {
+    ctx.save();
+    const shrink = 1 - Math.min(0.55, jumpOff / 70);
+    ctx.fillStyle = `rgba(0,0,0,${0.28 * shrink})`;
+    ctx.beginPath();
+    ctx.ellipse(x, yWater + 16, 40 * shrink, 6 * shrink, 0, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.restore();
+  }
+
+  ctx.save();
+  ctx.translate(x, y);
+  ctx.scale(0.6, 0.6);
+  // Leichter Neigungswinkel während der Flugphase (nach vorne/hinten kippen).
+  if (jumpOff > 0.5 && boat.jumpState === 3) {
+    const phase = Math.min(1, (boat.jumpTimer || 0) / 22);
+    ctx.rotate((0.5 - phase) * 0.35);
+  }
+
+  // Bugwelle (vorn) — Boot bewegt sich in -y (downstream), also V nach unten/oben?
+  // vy ist negativ (bewegt sich in -y World = nach oben auf Screen). Bugwelle entsteht
+  // also am oberen Ende (Spitze, die die Welle "aufwirft").
+  const waveT = tick * 0.12;
+  ctx.fillStyle = 'rgba(255,255,255,0.55)';
+  ctx.beginPath();
+  ctx.ellipse(0, -42 + Math.sin(waveT) * 1.5, 34, 7, 0, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.fillStyle = 'rgba(255,255,255,0.35)';
+  ctx.beginPath();
+  ctx.ellipse(-18, -38 + Math.sin(waveT + 1) * 1.2, 12, 4, 0.3, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.beginPath();
+  ctx.ellipse(18, -38 + Math.sin(waveT + 2) * 1.2, 12, 4, -0.3, 0, Math.PI * 2);
+  ctx.fill();
+
+  // Schatten unterm Rumpf
+  ctx.fillStyle = 'rgba(0,0,0,0.28)';
+  ctx.beginPath();
+  ctx.ellipse(2, 32, 66, 10, 0, 0, Math.PI * 2);
+  ctx.fill();
+
+  // Rumpf — Motorboot-Silhouette mit Bug vorne (oben)
+  const hullGrad = ctx.createLinearGradient(0, -30, 0, 30);
+  hullGrad.addColorStop(0, '#f3f4f6');
+  hullGrad.addColorStop(0.45, '#d8dce2');
+  hullGrad.addColorStop(1, '#8a95a3');
+  ctx.fillStyle = hullGrad;
+  ctx.strokeStyle = '#1b1f26';
+  ctx.lineWidth = 2.5;
+  ctx.beginPath();
+  // Umriss von oben-Mitte (Bug) im Uhrzeigersinn
+  ctx.moveTo(0, -38);
+  ctx.quadraticCurveTo(40, -30, 58, 0);
+  ctx.quadraticCurveTo(60, 22, 44, 28);
+  ctx.lineTo(-44, 28);
+  ctx.quadraticCurveTo(-60, 22, -58, 0);
+  ctx.quadraticCurveTo(-40, -30, 0, -38);
+  ctx.closePath();
+  ctx.fill(); ctx.stroke();
+
+  // Blaues Streifen-Band (Polizei-Identität) über die Länge
+  ctx.fillStyle = '#1e6fd9';
+  ctx.beginPath();
+  ctx.moveTo(-54, -2);
+  ctx.quadraticCurveTo(-40, -18, 0, -22);
+  ctx.quadraticCurveTo(40, -18, 54, -2);
+  ctx.lineTo(54, 6);
+  ctx.quadraticCurveTo(40, -10, 0, -14);
+  ctx.quadraticCurveTo(-40, -10, -54, 6);
+  ctx.closePath();
+  ctx.fill();
+  // Dünner gelber Strich unter dem Band
+  ctx.strokeStyle = '#ffd24a';
+  ctx.lineWidth = 1.5;
+  ctx.beginPath();
+  ctx.moveTo(-54, 7);
+  ctx.quadraticCurveTo(-40, -9, 0, -13);
+  ctx.quadraticCurveTo(40, -9, 54, 7);
+  ctx.stroke();
+
+  // Schriftzug POLICIJA (slowenisch) — besonders deutlich, Box darf über den Rumpf hinausragen.
+  ctx.fillStyle = '#ffffff';
+  ctx.fillRect(-64, -14, 128, 22);
+  ctx.strokeStyle = '#000';
+  ctx.lineWidth = 2;
+  ctx.strokeRect(-64, -14, 128, 22);
+  ctx.font = '900 22px "Arial Black", Impact, sans-serif';
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  ctx.lineWidth = 1.2;
+  ctx.fillStyle = '#000';
+  ctx.strokeStyle = '#000';
+  ctx.strokeText('POLICIJA', 0, -2);
+  ctx.fillText('POLICIJA', 0, -2);
+  ctx.textAlign = 'left';
+  ctx.textBaseline = 'alphabetic';
+
+  // Steuerhaus (Kabine) in der Mitte
+  const cabGrad = ctx.createLinearGradient(0, 4, 0, 24);
+  cabGrad.addColorStop(0, '#2a3240');
+  cabGrad.addColorStop(1, '#141820');
+  ctx.fillStyle = cabGrad;
+  ctx.strokeStyle = '#0b0e13';
+  ctx.lineWidth = 2;
+  ctx.beginPath();
+  ctx.moveTo(-24, 22);
+  ctx.lineTo(-20, 4);
+  ctx.lineTo(20, 4);
+  ctx.lineTo(24, 22);
+  ctx.closePath();
+  ctx.fill(); ctx.stroke();
+  // Fenster
+  ctx.fillStyle = 'rgba(160, 210, 240, 0.75)';
+  ctx.fillRect(-16, 8, 32, 8);
+  ctx.strokeStyle = '#0b0e13';
+  ctx.lineWidth = 1;
+  ctx.beginPath();
+  ctx.moveTo(0, 8); ctx.lineTo(0, 16);
+  ctx.stroke();
+
+  // Blinklicht-Balken auf dem Dach
+  ctx.fillStyle = '#1b1f26';
+  ctx.fillRect(-16, -2, 32, 6);
+  const phase = boat.blinkPhase;
+  const leftOn = Math.floor(phase / 10) % 2 === 0;
+  const L_col = leftOn ? '#2b8bff' : '#3a1f1f';
+  const R_col = leftOn ? '#4a1f1f' : '#ff3030';
+  // Glow-Halo (nur aktive Seite)
+  if (leftOn) {
+    const g = ctx.createRadialGradient(-9, 1, 1, -9, 1, 22);
+    g.addColorStop(0, 'rgba(80, 160, 255, 0.7)');
+    g.addColorStop(1, 'rgba(80, 160, 255, 0)');
+    ctx.fillStyle = g;
+    ctx.beginPath(); ctx.arc(-9, 1, 22, 0, Math.PI * 2); ctx.fill();
+  } else {
+    const g = ctx.createRadialGradient(9, 1, 1, 9, 1, 22);
+    g.addColorStop(0, 'rgba(255, 70, 70, 0.7)');
+    g.addColorStop(1, 'rgba(255, 70, 70, 0)');
+    ctx.fillStyle = g;
+    ctx.beginPath(); ctx.arc(9, 1, 22, 0, Math.PI * 2); ctx.fill();
+  }
+  // Linsen
+  ctx.fillStyle = L_col;
+  ctx.beginPath(); ctx.ellipse(-9, 1, 6, 3, 0, 0, Math.PI * 2); ctx.fill();
+  ctx.fillStyle = R_col;
+  ctx.beginPath(); ctx.ellipse(9, 1, 6, 3, 0, 0, Math.PI * 2); ctx.fill();
+  ctx.strokeStyle = '#0b0e13';
+  ctx.lineWidth = 1;
+  ctx.beginPath(); ctx.ellipse(-9, 1, 6, 3, 0, 0, Math.PI * 2); ctx.stroke();
+  ctx.beginPath(); ctx.ellipse(9, 1, 6, 3, 0, 0, Math.PI * 2); ctx.stroke();
+
+  // Kleine Deck-Details
+  ctx.strokeStyle = 'rgba(0,0,0,0.25)';
+  ctx.lineWidth = 1;
+  ctx.beginPath();
+  ctx.moveTo(-48, 20); ctx.lineTo(48, 20);
+  ctx.stroke();
+
+  // Pollerchen am Heck
+  ctx.fillStyle = '#262a33';
+  ctx.fillRect(-30, 26, 4, 4);
+  ctx.fillRect(26, 26, 4, 4);
+
+  ctx.restore();
+}
+
+function draw() {
+  ctx.clearRect(0, 0, WIDTH, HEIGHT);
+
+  const skyGrad = ctx.createLinearGradient(0, 0, 0, HEIGHT);
+  skyGrad.addColorStop(0, '#87CEEB');
+  skyGrad.addColorStop(0.6, '#A8D8E8');
+  skyGrad.addColorStop(1, '#B8E2EC');
+  ctx.fillStyle = skyGrad;
+  ctx.fillRect(0, 0, WIDTH, HEIGHT);
+
+  drawBanks();
+  drawWater();
+  drawWaves();
+
+  obstacles.forEach(o => o.type === 'rock' ? drawRock(o) : drawLog(o));
+  collectibles.forEach(item => {
+    if (item.type === 'banana') drawBanana(item);
+    else if (item.type === 'riegel') drawRiegel(item);
+  });
+  fishes.forEach(drawFish);
+  policeBoats.forEach(drawPoliceBoat);
+
+  // Bäume VOR Kajak/Personen zeichnen, damit sie die Strand-Szene nicht verdecken.
+  trees.forEach(drawTree);
+  drawKayak();
+  drawSplashes();
+  fishermen.forEach(drawFisherman);
+  drawScorePops();
+  drawHUD();
+}
+
+// Fixed-Timestep-Loop: update() läuft fix bei 60 Hz, unabhängig von der
+// Display-Refresh-Rate (60/120/144 Hz). So läuft das Spiel überall gleich schnell.
+const FIXED_DT = 1000 / 60;
+let _loopLastTime = 0;
+let _loopAcc = 0;
+let _loopError = null;
+function loop(now) {
+  if (!_loopLastTime) _loopLastTime = now || performance.now();
+  const t = now || performance.now();
+  const delta = Math.min(250, t - _loopLastTime);
+  _loopLastTime = t;
+  _loopAcc += delta;
+  // Maximal 5 update()-Ticks pro Frame, verhindert "spiral of death" bei Lag.
+  try {
+    let steps = 0;
+    while (_loopAcc >= FIXED_DT && steps < 5) {
+      update();
+      _loopAcc -= FIXED_DT;
+      steps++;
+    }
+    if (_loopAcc > FIXED_DT * 5) _loopAcc = 0;
+    draw();
+  } catch (err) {
+    _loopError = err;
+    // Notfall-Rendering: Fehler sichtbar machen statt schwarzem Bildschirm.
+    try {
+      ctx.fillStyle = '#222';
+      ctx.fillRect(0, 0, WIDTH || 390, HEIGHT || 600);
+      ctx.fillStyle = '#ff6a4a';
+      ctx.font = 'bold 16px Arial';
+      ctx.textAlign = 'left';
+      ctx.fillText('Fehler in der Schleife:', 20, 40);
+      ctx.fillStyle = '#fff';
+      ctx.font = '12px monospace';
+      const msg = String(err && err.stack || err).split('\n').slice(0, 12);
+      msg.forEach((line, i) => ctx.fillText(line.slice(0, 60), 20, 70 + i * 16));
+    } catch (_) {}
+    console.error('Game loop error:', err);
+  }
+  requestAnimationFrame(loop);
+}
+</script>
+</body>
+</html>
