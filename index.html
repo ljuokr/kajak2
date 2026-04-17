@@ -21,10 +21,56 @@
       height: auto;
       touch-action: none;
     }
+    .dpad {
+      position: fixed;
+      bottom: calc(env(safe-area-inset-bottom, 0px) + 14px);
+      left: 14px;
+      display: grid;
+      grid-template-columns: repeat(3, 58px);
+      grid-template-rows: repeat(3, 58px);
+      gap: 4px;
+      z-index: 10;
+      touch-action: none;
+      user-select: none;
+      -webkit-user-select: none;
+      -webkit-tap-highlight-color: transparent;
+    }
+    .dpad button {
+      background: rgba(30, 40, 55, 0.55);
+      color: #fff;
+      border: 1.5px solid rgba(255, 255, 255, 0.35);
+      border-radius: 12px;
+      font-size: 30px;
+      font-weight: bold;
+      padding: 0;
+      margin: 0;
+      line-height: 1;
+      font-family: -apple-system, Arial, sans-serif;
+      touch-action: none;
+      -webkit-user-select: none;
+      user-select: none;
+      -webkit-tap-highlight-color: transparent;
+      cursor: pointer;
+    }
+    .dpad button.pressed,
+    .dpad button:active {
+      background: rgba(70, 130, 200, 0.85);
+      border-color: rgba(255, 255, 255, 0.7);
+    }
+    .dpad .up    { grid-column: 2; grid-row: 1; }
+    .dpad .left  { grid-column: 1; grid-row: 2; }
+    .dpad .right { grid-column: 3; grid-row: 2; }
+    .dpad .down  { grid-column: 2; grid-row: 3; }
   </style>
 </head>
 <body>
 <canvas id="game"></canvas>
+<div class="dpad" aria-hidden="true">
+  <button class="up"    data-key="ArrowUp"    aria-label="Vorwärts">↑</button>
+  <button class="left"  data-key="ArrowLeft"  aria-label="Links">←</button>
+  <button class="right" data-key="ArrowRight" aria-label="Rechts">→</button>
+  <button class="down"  data-key="ArrowDown"  aria-label="Rückwärts">↓</button>
+</div>
 <script>
 /* ---------- Display constants ---------- */
 const BASE_W = 390, BASE_H = 844;
@@ -83,16 +129,16 @@ const irregPoly = (a, b) => {
 /* Schwierigkeit steigt sehr sanft und spät */
 function computeDifficulty() {
   // 4 Level, je eines pro Geheimzahl — Level 2 & 3 deutlich stärker:
-  //   <30  = Level 1, schwach       (0.3×)   Rückwärtspaddeln easy
-  //   30-59 = Level 2, kräftig      (1.3×)
-  //   60-89 = Level 3, stark        (2.1×)
-  //   ≥90   = Level 4, sehr stark   (2.9×)
-  if (score < 25) return 0.3;
-  if (score < 30) return 0.3 + ((score - 25) / 5) * 1.0;    // 0.3 → 1.3
-  if (score < 55) return 1.3;
-  if (score < 60) return 1.3 + ((score - 55) / 5) * 0.8;    // 1.3 → 2.1
-  if (score < 85) return 2.1;
-  if (score < 90) return 2.1 + ((score - 85) / 5) * 0.8;    // 2.1 → 2.9
+  //   <100   = Level 1, schwach       (0.3×)   Rückwärtspaddeln easy
+  //   100-199 = Level 2, kräftig      (1.3×)
+  //   200-299 = Level 3, stark        (2.1×)
+  //   ≥300   = Level 4, sehr stark   (2.9×)
+  if (score < 95)  return 0.3;
+  if (score < 100) return 0.3 + ((score - 95) / 5) * 1.0;    // 0.3 → 1.3
+  if (score < 195) return 1.3;
+  if (score < 200) return 1.3 + ((score - 195) / 5) * 0.8;   // 1.3 → 2.1
+  if (score < 295) return 2.1;
+  if (score < 300) return 2.1 + ((score - 295) / 5) * 0.8;   // 2.1 → 2.9
   return 2.9;
 }
 
@@ -850,6 +896,16 @@ function startMusic() {
   // iOS: Context startet suspended bis zum ersten User-Gesture.
   if (ac.state === 'suspended') ac.resume();
 
+  // iOS-Unlock: ein leerer Buffer, synchron im Gesture abgespielt,
+  // bringt Safari/iOS dazu, die Audio-Ausgabe freizugeben.
+  try {
+    const unlockBuf = ac.createBuffer(1, 1, 22050);
+    const unlockSrc = ac.createBufferSource();
+    unlockSrc.buffer = unlockBuf;
+    unlockSrc.connect(ac.destination);
+    unlockSrc.start(0);
+  } catch (e) { /* ignore */ }
+
   masterGain = ac.createGain();
   masterGain.gain.value = soundMuted ? 0 : 1;
   masterGain.connect(ac.destination);
@@ -1260,6 +1316,56 @@ cvs.addEventListener('touchend', e => {
   e.preventDefault();
   touchTargetX = null; touchTargetY = null;
 }, { passive: false });
+
+// Globales Audio-Unlock: jeder erste Tap/Click irgendwo auf der Seite
+// startet (idempotent) den AudioContext. Wichtig für iPhone, wo der
+// Canvas-Touch nicht der einzige Weg zur Freigabe sein soll.
+['touchstart', 'touchend', 'pointerdown', 'click'].forEach(ev => {
+  document.addEventListener(ev, startMusic, { passive: true, capture: true });
+});
+
+// On-Screen D-Pad: überträgt Taps auf die keys-Map, identisch zu den
+// Pfeiltasten. Multi-Touch per pointerId, damit zwei Finger (z.B. ↑ + →)
+// gleichzeitig gehen.
+(function bindDpad() {
+  const buttons = document.querySelectorAll('.dpad button');
+  if (!buttons.length) return;
+  const active = new Map(); // pointerId → { btn, key }
+  buttons.forEach(btn => {
+    const key = btn.dataset.key;
+    const press = (id) => {
+      keys[key] = true;
+      btn.classList.add('pressed');
+      if (id != null) active.set(id, { btn, key });
+      startMusic();
+    };
+    const release = (id) => {
+      if (id != null) active.delete(id);
+      // Nur loslassen, wenn kein anderer Pointer noch auf derselben Taste liegt.
+      let stillHeld = false;
+      for (const v of active.values()) if (v.key === key) { stillHeld = true; break; }
+      if (!stillHeld) {
+        keys[key] = false;
+        btn.classList.remove('pressed');
+      }
+    };
+    btn.addEventListener('pointerdown', e => {
+      e.preventDefault();
+      btn.setPointerCapture?.(e.pointerId);
+      press(e.pointerId);
+    });
+    const up = e => { e.preventDefault(); release(e.pointerId); };
+    btn.addEventListener('pointerup', up);
+    btn.addEventListener('pointercancel', up);
+    btn.addEventListener('pointerleave', up);
+    // Fallback (ältere iOS ohne PointerEvents)
+    btn.addEventListener('touchstart', e => { e.preventDefault(); press(null); }, { passive: false });
+    btn.addEventListener('touchend',   e => { e.preventDefault(); release(null); }, { passive: false });
+    btn.addEventListener('touchcancel', e => { e.preventDefault(); release(null); }, { passive: false });
+    // Rechtsklick-Menü unterdrücken (lange gedrückt halten auf iOS)
+    btn.addEventListener('contextmenu', e => e.preventDefault());
+  });
+})();
 
 function isInEddy(wx, wy) {
   // Ellipse auf Downstream-Seite, in Fliessrichtung vertikal gestreckt — selbe Geometrie wie drawRock.
@@ -2420,7 +2526,7 @@ function drawHUD() {
     ctx.fillText('Distanz: ' + Math.floor(distance), WIDTH - 20, 60);
 
     // Level-Plakette oben rechts — Farbe entspricht der Strömungsstärke (4 Stufen).
-    const level = score < 30 ? 1 : score < 60 ? 2 : score < 90 ? 3 : 4;
+    const level = score < 100 ? 1 : score < 200 ? 2 : score < 300 ? 3 : 4;
     const levelCol = level === 1 ? '#3a7a3a'     // grün: ruhig
                    : level === 2 ? '#2e5f8a'     // blau: normal
                    : level === 3 ? '#c44a1a'     // orange: stark
@@ -2504,7 +2610,7 @@ function drawHUD() {
   }
   ctx.restore();
 
-  // Geheimzahlen aus dem Original: bei 40 / 80 / 120 Punkten erscheinen
+  // Geheimzahlen aus dem Original: bei 100 / 200 / 300 Punkten erscheinen
   // 3, 2, 4 als grosse goldene Ziffern unten mittig nebeneinander.
   ctx.save();
   ctx.font = 'bold 72px Arial';
@@ -2516,15 +2622,15 @@ function drawHUD() {
   ctx.shadowOffsetY = 2;
   const secretY = HEIGHT - 50;
   const secretX = WIDTH / 2 - 80;
-  // Fanfare, sobald eine Schwelle (30 / 60 / 90) neu erreicht wird.
-  const reached = (score >= 90) ? 3 : (score >= 60) ? 2 : (score >= 30) ? 1 : 0;
+  // Fanfare, sobald eine Schwelle (100 / 200 / 300) neu erreicht wird.
+  const reached = (score >= 300) ? 3 : (score >= 200) ? 2 : (score >= 100) ? 1 : 0;
   if (reached > secretsRevealed) {
     secretsRevealed = reached;
     playFanfare();
   }
-  if (score >= 30) ctx.fillText('3', secretX,       secretY);
-  if (score >= 60) ctx.fillText('2', secretX +  80, secretY);
-  if (score >= 90) ctx.fillText('4', secretX + 160, secretY);
+  if (score >= 100) ctx.fillText('3', secretX,       secretY);
+  if (score >= 200) ctx.fillText('2', secretX +  80, secretY);
+  if (score >= 300) ctx.fillText('4', secretX + 160, secretY);
   ctx.restore();
 
   ctx.textAlign = 'left';
