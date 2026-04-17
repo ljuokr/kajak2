@@ -73,64 +73,6 @@
       stroke: #5a3a20;
       stroke-width: 1.4;
     }
-    .sound-test {
-      position: fixed;
-      top: calc(env(safe-area-inset-top, 0px) + 10px);
-      right: 10px;
-      z-index: 20;
-      font-family: -apple-system, Arial, sans-serif;
-      -webkit-user-select: none;
-      user-select: none;
-    }
-    .sound-test-toggle {
-      background: rgba(30, 40, 55, 0.85);
-      color: #fff;
-      border: 1.5px solid rgba(255, 255, 255, 0.35);
-      border-radius: 20px;
-      width: 40px;
-      height: 40px;
-      font-size: 17px;
-      cursor: pointer;
-      padding: 0;
-      touch-action: manipulation;
-      -webkit-tap-highlight-color: transparent;
-    }
-    .sound-test-panel {
-      margin-top: 6px;
-      background: rgba(20, 30, 45, 0.95);
-      border: 1.5px solid rgba(255, 255, 255, 0.3);
-      border-radius: 10px;
-      padding: 10px;
-      display: flex;
-      flex-direction: column;
-      gap: 6px;
-      min-width: 220px;
-      color: #fff;
-    }
-    .sound-test-panel[hidden] { display: none; }
-    .sound-test-panel h3 {
-      margin: 0 0 4px 0;
-      font-size: 12px;
-      font-weight: bold;
-      opacity: 0.75;
-      letter-spacing: 0.5px;
-    }
-    .sound-test-panel button {
-      background: rgba(70, 130, 200, 0.35);
-      color: #fff;
-      border: 1px solid rgba(255, 255, 255, 0.28);
-      border-radius: 6px;
-      padding: 8px 10px;
-      text-align: left;
-      font-size: 13px;
-      cursor: pointer;
-      touch-action: manipulation;
-      -webkit-tap-highlight-color: transparent;
-      font-family: inherit;
-    }
-    .sound-test-panel button:active {
-      background: rgba(70, 130, 200, 0.7);
-    }
   </style>
 </head>
 <body>
@@ -147,19 +89,6 @@
       <line class="grip" x1="26"  y1="-3.2" x2="26"  y2="3.2" />
     </g>
   </svg>
-</div>
-<div class="sound-test" aria-label="Sound-Test">
-  <button class="sound-test-toggle" type="button" aria-label="Sound-Test öffnen">♪</button>
-  <div class="sound-test-panel" hidden>
-    <h3>KENTER-SOUND TESTEN</h3>
-    <button data-variant="A" type="button">A · Multi-Tropfen-Splash</button>
-    <button data-variant="B" type="button">B · Unterwasser-Swoosh</button>
-    <button data-variant="C" type="button">C · Rauschwasser + LFO</button>
-    <button data-variant="D" type="button">D · Schrei „Aaah!"</button>
-    <button data-variant="E" type="button">E · „Oha!" zweisilbig</button>
-    <button data-variant="F" type="button">F · Schrei + Wasser</button>
-    <button data-variant="current" type="button">– aktueller Splash</button>
-  </div>
 </div>
 <script>
 /* ---------- Display constants ---------- */
@@ -1183,48 +1112,97 @@ function playSplash() {
   if (!musicStarted || !sfxBus) return;
   const ac = musicCtx;
   const t = ac.currentTime;
-  // Wasser-Splash: gefiltertes Rauschen mit Sweep von hell nach dunkel, plus
-  // kurzer Höhenspritzer für die Tröpfchen. KEIN tiefer Sinus-„Plumps" — der
-  // klang vorher nach Knall/Faustschlag, nicht nach Wasser.
-  const bufLen = Math.floor(ac.sampleRate * 0.7);
-  const buf = ac.createBuffer(1, bufLen, ac.sampleRate);
-  const d = buf.getChannelData(0);
-  let last = 0;
-  for (let i = 0; i < bufLen; i++) {
-    const p = i / bufLen;
-    // Leicht korreliertes Rauschen (wärmer als reines weißes Rauschen).
-    last = 0.9 * last + 0.1 * (Math.random() * 2 - 1);
-    // Scharfer Hit plus längerer Tail für das Ausschwingen.
-    const env = Math.exp(-p * 2.5) + 0.22 * Math.exp(-p * 6);
-    d[i] = last * 2.6 * env;
-  }
-  const src = ac.createBufferSource(); src.buffer = buf;
-  // Bandpass-Sweep: 1800 Hz → 420 Hz — Wasser „fällt und beruhigt sich".
-  const bp = ac.createBiquadFilter();
-  bp.type = 'bandpass';
-  bp.frequency.setValueAtTime(1800, t);
-  bp.frequency.exponentialRampToValueAtTime(420, t + 0.55);
-  bp.Q.value = 0.9;
-  const g = ac.createGain();
-  g.gain.setValueAtTime(0.75, t);
-  g.gain.exponentialRampToValueAtTime(0.001, t + 0.7);
-  src.connect(bp); bp.connect(g); g.connect(sfxBus);
-  src.start(t);
+  // Zufälliger Wechsel zwischen zwei Kenter-Varianten:
+  //  „Oha!"           — zweisilbiger Ausruf
+  //  „Aaah!" + Wasser — Schrei mit Vibrato, gefolgt von Unterwasser-Swoosh
+  if (Math.random() < 0.5) {
+    // „Oha!": kurzer hoher + etwas längerer tieferer Saw-Ton mit Vokal-Formant.
+    const parts = [
+      { f: 600, s: 0,    d: 0.13 },
+      { f: 340, s: 0.16, d: 0.32 }
+    ];
+    parts.forEach(p => {
+      const sT = t + p.s;
+      const osc = ac.createOscillator();
+      osc.type = 'sawtooth';
+      osc.frequency.setValueAtTime(p.f, sT);
+      osc.frequency.exponentialRampToValueAtTime(p.f * 0.78, sT + p.d);
+      const f1 = ac.createBiquadFilter();
+      f1.type = 'bandpass'; f1.frequency.value = 760; f1.Q.value = 5;
+      const g1 = ac.createGain(); g1.gain.value = 0.7;
+      osc.connect(f1); f1.connect(g1);
+      const env = ac.createGain();
+      env.gain.setValueAtTime(0, sT);
+      env.gain.linearRampToValueAtTime(0.38, sT + 0.03);
+      env.gain.exponentialRampToValueAtTime(0.001, sT + p.d);
+      g1.connect(env); env.connect(sfxBus);
+      osc.start(sT); osc.stop(sT + p.d + 0.05);
+    });
+  } else {
+    // „Aaah!": Sawtooth mit Pitch-Drop 520→300 Hz, leichtem Vibrato und zwei
+    // Vokal-Formanten (800 Hz + 1200 Hz Bandpass).
+    const dur = 0.4;
+    const osc = ac.createOscillator();
+    osc.type = 'sawtooth';
+    osc.frequency.setValueAtTime(520, t);
+    osc.frequency.exponentialRampToValueAtTime(300, t + dur);
+    const vib = ac.createOscillator();
+    vib.type = 'sine'; vib.frequency.value = 7;
+    const vibGain = ac.createGain(); vibGain.gain.value = 16;
+    vib.connect(vibGain); vibGain.connect(osc.frequency);
+    vib.start(t); vib.stop(t + dur);
+    const f1 = ac.createBiquadFilter();
+    f1.type = 'bandpass'; f1.frequency.value = 800; f1.Q.value = 5;
+    const f2 = ac.createBiquadFilter();
+    f2.type = 'bandpass'; f2.frequency.value = 1200; f2.Q.value = 4;
+    const g1 = ac.createGain(); g1.gain.value = 0.6;
+    const g2 = ac.createGain(); g2.gain.value = 0.4;
+    const sum = ac.createGain(); sum.gain.value = 1;
+    osc.connect(f1); f1.connect(g1); g1.connect(sum);
+    osc.connect(f2); f2.connect(g2); g2.connect(sum);
+    const env = ac.createGain();
+    env.gain.setValueAtTime(0, t);
+    env.gain.linearRampToValueAtTime(0.4, t + 0.04);
+    env.gain.setValueAtTime(0.32, t + dur * 0.6);
+    env.gain.exponentialRampToValueAtTime(0.001, t + dur);
+    sum.connect(env); env.connect(sfxBus);
+    osc.start(t); osc.stop(t + dur + 0.05);
 
-  // Höhen-Tröpfchen: kurzes, scharf gefiltertes Hochpass-Rauschen.
-  const dropsBuf = ac.createBuffer(1, Math.floor(ac.sampleRate * 0.16), ac.sampleRate);
-  const dd = dropsBuf.getChannelData(0);
-  for (let i = 0; i < dd.length; i++) {
-    dd[i] = (Math.random() * 2 - 1) * Math.exp(-(i / dd.length) * 7);
+    // Unterwasser-Swoosh 180 ms versetzt: Lowpass-Sweep 3k→200 Hz + 3 Bubbles.
+    const sT = t + 0.18;
+    const bufLen = Math.floor(ac.sampleRate * 0.75);
+    const buf = ac.createBuffer(1, bufLen, ac.sampleRate);
+    const dn = buf.getChannelData(0);
+    let last = 0;
+    for (let i = 0; i < bufLen; i++) {
+      const p = i / bufLen;
+      last = 0.9 * last + 0.1 * (Math.random() * 2 - 1);
+      dn[i] = last * 2.8 * Math.exp(-p * 1.7);
+    }
+    const src = ac.createBufferSource(); src.buffer = buf;
+    const lp = ac.createBiquadFilter();
+    lp.type = 'lowpass'; lp.Q.value = 2;
+    lp.frequency.setValueAtTime(3000, sT);
+    lp.frequency.exponentialRampToValueAtTime(200, sT + 0.5);
+    const wg = ac.createGain();
+    wg.gain.setValueAtTime(0.65, sT);
+    wg.gain.exponentialRampToValueAtTime(0.001, sT + 0.75);
+    src.connect(lp); lp.connect(wg); wg.connect(sfxBus);
+    src.start(sT);
+    [0.09, 0.22, 0.38].forEach((off, i) => {
+      const bsT = sT + off;
+      const o = ac.createOscillator();
+      o.type = 'sine';
+      const f = 80 + Math.random() * 80;
+      o.frequency.setValueAtTime(f, bsT);
+      o.frequency.exponentialRampToValueAtTime(f * 1.9, bsT + 0.08);
+      const og = ac.createGain();
+      og.gain.setValueAtTime(Math.max(0.1, 0.3 - i * 0.08), bsT);
+      og.gain.exponentialRampToValueAtTime(0.001, bsT + 0.12);
+      o.connect(og); og.connect(sfxBus);
+      o.start(bsT); o.stop(bsT + 0.14);
+    });
   }
-  const drops = ac.createBufferSource(); drops.buffer = dropsBuf;
-  const hp = ac.createBiquadFilter();
-  hp.type = 'highpass'; hp.frequency.value = 2600;
-  const dg = ac.createGain();
-  dg.gain.setValueAtTime(0.28, t);
-  dg.gain.exponentialRampToValueAtTime(0.001, t + 0.18);
-  drops.connect(hp); hp.connect(dg); dg.connect(sfxBus);
-  drops.start(t);
 }
 
 // "Nam-nam-nam" beim Essen: drei schnelle Tiefpass-Kauer-Impulse.
@@ -1554,210 +1532,6 @@ cvs.addEventListener('touchend', e => {
   joy.addEventListener('pointerup', up);
   joy.addEventListener('pointercancel', up);
   joy.addEventListener('contextmenu', e => e.preventDefault());
-})();
-
-// ----- Sound-Test-Panel: spielt die Alternativen für den Kenter-Sound ab. -----
-// Ist ein Entwickler-Tool; sobald die Wahl feststeht, kann das wieder raus.
-function playSplashA() {
-  // Multi-Tropfen: 5-6 zeitlich versetzte Highpass-Impulse + weicher Tail.
-  if (!musicStarted || !sfxBus) return;
-  const ac = musicCtx, t = ac.currentTime;
-  const drops = [0, 0.04, 0.09, 0.15, 0.23, 0.34];
-  drops.forEach((off, i) => {
-    const sT = t + off;
-    const dur = 0.07 + Math.random() * 0.04;
-    const buf = ac.createBuffer(1, Math.floor(ac.sampleRate * dur), ac.sampleRate);
-    const d = buf.getChannelData(0);
-    for (let j = 0; j < d.length; j++) {
-      d[j] = (Math.random() * 2 - 1) * Math.exp(-(j / d.length) * 8);
-    }
-    const src = ac.createBufferSource(); src.buffer = buf;
-    const hp = ac.createBiquadFilter();
-    hp.type = 'highpass';
-    hp.frequency.value = 2100 + Math.random() * 1400;
-    const g = ac.createGain();
-    g.gain.setValueAtTime(Math.max(0.08, 0.32 - i * 0.035), sT);
-    g.gain.exponentialRampToValueAtTime(0.001, sT + dur);
-    src.connect(hp); hp.connect(g); g.connect(sfxBus);
-    src.start(sT);
-  });
-  const tailBuf = ac.createBuffer(1, Math.floor(ac.sampleRate * 0.5), ac.sampleRate);
-  const td = tailBuf.getChannelData(0);
-  let last = 0;
-  for (let i = 0; i < td.length; i++) {
-    const p = i / td.length;
-    last = 0.92 * last + 0.08 * (Math.random() * 2 - 1);
-    td[i] = last * 2.2 * Math.exp(-p * 3);
-  }
-  const tSrc = ac.createBufferSource(); tSrc.buffer = tailBuf;
-  const bp = ac.createBiquadFilter();
-  bp.type = 'bandpass'; bp.frequency.value = 900; bp.Q.value = 0.8;
-  const tg = ac.createGain();
-  tg.gain.setValueAtTime(0.45, t + 0.02);
-  tg.gain.exponentialRampToValueAtTime(0.001, t + 0.55);
-  tSrc.connect(bp); bp.connect(tg); tg.connect(sfxBus);
-  tSrc.start(t + 0.02);
-}
-
-function playSplashB() {
-  // Unterwasser-Swoosh: Lowpass-Sweep 3k → 200 Hz + 3 Sinus-Bubbles.
-  if (!musicStarted || !sfxBus) return;
-  const ac = musicCtx, t = ac.currentTime;
-  const bufLen = Math.floor(ac.sampleRate * 0.75);
-  const buf = ac.createBuffer(1, bufLen, ac.sampleRate);
-  const d = buf.getChannelData(0);
-  let last = 0;
-  for (let i = 0; i < bufLen; i++) {
-    const p = i / bufLen;
-    last = 0.9 * last + 0.1 * (Math.random() * 2 - 1);
-    d[i] = last * 2.8 * Math.exp(-p * 1.7);
-  }
-  const src = ac.createBufferSource(); src.buffer = buf;
-  const lp = ac.createBiquadFilter();
-  lp.type = 'lowpass';
-  lp.frequency.setValueAtTime(3000, t);
-  lp.frequency.exponentialRampToValueAtTime(200, t + 0.5);
-  lp.Q.value = 2;
-  const g = ac.createGain();
-  g.gain.setValueAtTime(0.8, t);
-  g.gain.exponentialRampToValueAtTime(0.001, t + 0.75);
-  src.connect(lp); lp.connect(g); g.connect(sfxBus);
-  src.start(t);
-  [0.09, 0.22, 0.38].forEach((off, i) => {
-    const sT = t + off;
-    const o = ac.createOscillator();
-    o.type = 'sine';
-    const f = 80 + Math.random() * 80;
-    o.frequency.setValueAtTime(f, sT);
-    o.frequency.exponentialRampToValueAtTime(f * 1.9, sT + 0.08);
-    const og = ac.createGain();
-    og.gain.setValueAtTime(Math.max(0.1, 0.3 - i * 0.08), sT);
-    og.gain.exponentialRampToValueAtTime(0.001, sT + 0.12);
-    o.connect(og); og.connect(sfxBus);
-    o.start(sT); o.stop(sT + 0.14);
-  });
-}
-
-function playSplashC() {
-  // Rauschwasser ~1.1 s mit LFO auf Bandpass-Frequenz.
-  if (!musicStarted || !sfxBus) return;
-  const ac = musicCtx, t = ac.currentTime;
-  const bufLen = Math.floor(ac.sampleRate * 1.1);
-  const buf = ac.createBuffer(1, bufLen, ac.sampleRate);
-  const d = buf.getChannelData(0);
-  let last = 0;
-  for (let i = 0; i < bufLen; i++) {
-    const p = i / bufLen;
-    last = 0.88 * last + 0.12 * (Math.random() * 2 - 1);
-    const env = (1 - Math.exp(-p * 18)) * Math.exp(-p * 1.6);
-    d[i] = last * 2.5 * env;
-  }
-  const src = ac.createBufferSource(); src.buffer = buf;
-  const bp = ac.createBiquadFilter();
-  bp.type = 'bandpass'; bp.Q.value = 1.3;
-  bp.frequency.setValueAtTime(1400, t);
-  const lfo = ac.createOscillator();
-  lfo.type = 'sine'; lfo.frequency.value = 4;
-  const lfoGain = ac.createGain();
-  lfoGain.gain.value = 700;
-  lfo.connect(lfoGain); lfoGain.connect(bp.frequency);
-  lfo.start(t); lfo.stop(t + 1.1);
-  const g = ac.createGain();
-  g.gain.setValueAtTime(0.7, t);
-  g.gain.exponentialRampToValueAtTime(0.001, t + 1.1);
-  src.connect(bp); bp.connect(g); g.connect(sfxBus);
-  src.start(t);
-}
-
-function playSplashD() {
-  // Kurzes „Aaah!": Sawtooth mit Vokal-Formanten + leichtem Vibrato, Pitch fällt.
-  if (!musicStarted || !sfxBus) return;
-  const ac = musicCtx, t = ac.currentTime;
-  const dur = 0.4;
-  const osc = ac.createOscillator();
-  osc.type = 'sawtooth';
-  osc.frequency.setValueAtTime(520, t);
-  osc.frequency.exponentialRampToValueAtTime(300, t + dur);
-  const vib = ac.createOscillator();
-  vib.type = 'sine'; vib.frequency.value = 7;
-  const vibGain = ac.createGain(); vibGain.gain.value = 16;
-  vib.connect(vibGain); vibGain.connect(osc.frequency);
-  vib.start(t); vib.stop(t + dur);
-  const f1 = ac.createBiquadFilter();
-  f1.type = 'bandpass'; f1.frequency.value = 800; f1.Q.value = 5;
-  const f2 = ac.createBiquadFilter();
-  f2.type = 'bandpass'; f2.frequency.value = 1200; f2.Q.value = 4;
-  const g1 = ac.createGain(); g1.gain.value = 0.6;
-  const g2 = ac.createGain(); g2.gain.value = 0.4;
-  const sum = ac.createGain(); sum.gain.value = 1;
-  osc.connect(f1); f1.connect(g1); g1.connect(sum);
-  osc.connect(f2); f2.connect(g2); g2.connect(sum);
-  const env = ac.createGain();
-  env.gain.setValueAtTime(0, t);
-  env.gain.linearRampToValueAtTime(0.4, t + 0.04);
-  env.gain.setValueAtTime(0.32, t + dur * 0.6);
-  env.gain.exponentialRampToValueAtTime(0.001, t + dur);
-  sum.connect(env); env.connect(sfxBus);
-  osc.start(t); osc.stop(t + dur + 0.05);
-}
-
-function playSplashE() {
-  // „Oha!" zweisilbig: kurzer hoher + längerer tieferer Saw-Ton mit Formanten.
-  if (!musicStarted || !sfxBus) return;
-  const ac = musicCtx, t = ac.currentTime;
-  const parts = [
-    { f: 600, s: 0,    d: 0.13 },
-    { f: 340, s: 0.16, d: 0.32 }
-  ];
-  parts.forEach(p => {
-    const sT = t + p.s;
-    const osc = ac.createOscillator();
-    osc.type = 'sawtooth';
-    osc.frequency.setValueAtTime(p.f, sT);
-    osc.frequency.exponentialRampToValueAtTime(p.f * 0.78, sT + p.d);
-    const f1 = ac.createBiquadFilter();
-    f1.type = 'bandpass'; f1.frequency.value = 760; f1.Q.value = 5;
-    const g1 = ac.createGain(); g1.gain.value = 0.7;
-    osc.connect(f1); f1.connect(g1);
-    const env = ac.createGain();
-    env.gain.setValueAtTime(0, sT);
-    env.gain.linearRampToValueAtTime(0.38, sT + 0.03);
-    env.gain.exponentialRampToValueAtTime(0.001, sT + p.d);
-    g1.connect(env); env.connect(sfxBus);
-    osc.start(sT); osc.stop(sT + p.d + 0.05);
-  });
-}
-
-function playSplashF() {
-  // Kombi: Schrei (D) sofort, Wasser (B) 180 ms versetzt.
-  playSplashD();
-  setTimeout(() => playSplashB(), 180);
-}
-
-(function bindSoundTest() {
-  const wrap = document.querySelector('.sound-test');
-  if (!wrap) return;
-  const toggle = wrap.querySelector('.sound-test-toggle');
-  const panel = wrap.querySelector('.sound-test-panel');
-  const variants = {
-    A: playSplashA, B: playSplashB, C: playSplashC,
-    D: playSplashD, E: playSplashE, F: playSplashF,
-    current: () => playSplash()
-  };
-  toggle.addEventListener('click', e => {
-    e.preventDefault();
-    panel.hidden = !panel.hidden;
-  });
-  panel.querySelectorAll('button[data-variant]').forEach(btn => {
-    btn.addEventListener('click', e => {
-      e.preventDefault();
-      // Audio entsperren und ggf. stumm schalten aufheben, damit man was hört.
-      startMusic();
-      if (soundMuted) toggleMute();
-      const fn = variants[btn.dataset.variant];
-      if (fn) fn();
-    });
-  });
 })();
 
 function isInEddy(wx, wy) {
