@@ -878,7 +878,7 @@ window.addEventListener('click', e => {
   const rect = cvs.getBoundingClientRect();
   const cx = (e.clientX - rect.left) * (WIDTH / rect.width);
   const cy = (e.clientY - rect.top) * (HEIGHT / rect.height);
-  const btnX = WIDTH / 2 - 22, btnY = HEIGHT - 44, btnW = 44, btnH = 36;
+  const btnX = 8, btnY = 8, btnW = 44, btnH = 36;
   if (cx >= btnX && cx <= btnX + btnW && cy >= btnY && cy <= btnY + btnH) {
     startMusic();
     toggleMute();
@@ -902,7 +902,10 @@ window.addEventListener('keyup', e => {
 let musicCtx = null, musicStarted = false;
 let masterGain = null, musicBus = null, sfxBus = null;
 let noiseGainNode = null, noiseLPNode = null;
-let soundMuted = false;
+// Start STUMM: so ist der erste Tap auf den Sound-Button ein einziger
+// User-Gesture, der sowohl den AudioContext entsperrt als auch unmutet —
+// das umgeht den iOS-Bug, wo initiales Scheduling manchmal verloren geht.
+let soundMuted = true;
 
 function startMusic() {
   if (musicStarted) {
@@ -1333,9 +1336,13 @@ function updatePoliceSiren() {
 
 function toggleMute() {
   soundMuted = !soundMuted;
-  if (masterGain) {
-    masterGain.gain.cancelScheduledValues(musicCtx.currentTime);
-    masterGain.gain.linearRampToValueAtTime(soundMuted ? 0 : 1, musicCtx.currentTime + 0.08);
+  if (masterGain && musicCtx) {
+    const t = musicCtx.currentTime;
+    masterGain.gain.cancelScheduledValues(t);
+    // Explizit vom aktuellen Wert aus rampen — ohne Anker nimmt Safari manchmal
+    // den Default-Wert als Startpunkt statt des Ist-Werts.
+    masterGain.gain.setValueAtTime(masterGain.gain.value, t);
+    masterGain.gain.linearRampToValueAtTime(soundMuted ? 0 : 1, t + 0.1);
   }
 }
 
@@ -1354,7 +1361,7 @@ cvs.addEventListener('touchstart', e => {
   const tx = (touch.clientX - rect.left) * (WIDTH / rect.width);
   const ty = (touch.clientY - rect.top) * (HEIGHT / rect.height);
   // Ton-Button am unteren Rand (gleiche Geometrie wie in drawHUD).
-  const btnX = WIDTH / 2 - 22, btnY = HEIGHT - 44, btnW = 44, btnH = 36;
+  const btnX = 8, btnY = 8, btnW = 44, btnH = 36;
   if (tx >= btnX && tx <= btnX + btnW && ty >= btnY && ty <= btnY + btnH) {
     startMusic();
     toggleMute();
@@ -2577,7 +2584,8 @@ function drawHUD() {
   // Paddel-Lebensanzeige: schwarze Paddel, gut sichtbar, 3 feste Slots.
   const MAX_LIVES = 3;
   for (let i = 0; i < MAX_LIVES; i++) {
-    const x = 46 + i * 62;
+    // Lives nach rechts geschoben, damit oben links Platz für den Sound-Button ist.
+    const x = 94 + i * 62;
     const y = 36;
     const active = i < lives;
     ctx.save();
@@ -2663,9 +2671,30 @@ function drawHUD() {
     ctx.textBaseline = 'alphabetic';
   }
 
-  // Ton-Button als Lautsprecher-Icon am unteren Rand (Taste M weiterhin aktiv).
+  // Ton-Button als Lautsprecher-Icon oben links (Taste M weiterhin aktiv).
+  // Beim Start stumm — erster Tap entsperrt Audio und schaltet gleichzeitig an.
   ctx.save();
-  const btnX = WIDTH / 2 - 22, btnY = HEIGHT - 44, btnW = 44, btnH = 36;
+  const btnX = 8, btnY = 8, btnW = 44, btnH = 36;
+  // Pulsierender Ring, solange stumm, damit der Button als Start-Knopf auffällt.
+  if (soundMuted) {
+    const pulse = 0.5 + 0.5 * Math.sin(tick * 0.12);
+    ctx.strokeStyle = `rgba(255, 220, 80, ${0.35 + 0.5 * pulse})`;
+    ctx.lineWidth = 3 + 2 * pulse;
+    ctx.beginPath();
+    const pr = 10;
+    const pX = btnX - 5, pY = btnY - 5, pW = btnW + 10, pH = btnH + 10;
+    ctx.moveTo(pX + pr, pY);
+    ctx.lineTo(pX + pW - pr, pY);
+    ctx.quadraticCurveTo(pX + pW, pY, pX + pW, pY + pr);
+    ctx.lineTo(pX + pW, pY + pH - pr);
+    ctx.quadraticCurveTo(pX + pW, pY + pH, pX + pW - pr, pY + pH);
+    ctx.lineTo(pX + pr, pY + pH);
+    ctx.quadraticCurveTo(pX, pY + pH, pX, pY + pH - pr);
+    ctx.lineTo(pX, pY + pr);
+    ctx.quadraticCurveTo(pX, pY, pX + pr, pY);
+    ctx.closePath();
+    ctx.stroke();
+  }
   // Knopf-Hintergrund
   ctx.fillStyle = soundMuted ? 'rgba(196, 74, 26, 0.92)' : 'rgba(46, 95, 138, 0.92)';
   ctx.beginPath();
@@ -2776,11 +2805,11 @@ function drawHUD() {
     ctx.textAlign = 'left';
   }
 
-  // Start-Hinweis: zeigt „Sound → Klingelton ein!" bis zum ersten Audio-Unlock.
-  // Web Audio ist auf iOS an den Ringer-Switch gekoppelt — ohne Klingelton kein Ton.
-  if (!musicStarted) {
+  // Start-Hinweis: weist auf den Sound-Button oben links hin, solange stumm.
+  // Web Audio ist auf iOS zusätzlich an den Ringer-Switch gekoppelt.
+  if (soundMuted) {
     ctx.save();
-    const msg = 'Sound → Klingelton ein!';
+    const msg = 'Sound oben einschalten (Klingelton an!)';
     ctx.font = 'bold 20px Arial';
     ctx.textAlign = 'center';
     ctx.textBaseline = 'middle';
