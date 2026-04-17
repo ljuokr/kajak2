@@ -3347,18 +3347,17 @@ function drawPoliceBoat(boat) {
 
   // Schriftzug POLICIJA (slowenisch) — gross & hochkontrastig.
   // Box darf über den Rumpf hinausragen, sitzt oberhalb der Kabine.
+  // KEIN strokeText — der dicke Stroke verschwimmt durch die 0.6-Skalierung
+  // mit dem Fill zu einem schwarzen Klumpen; Arial Black ist schon 900.
   ctx.fillStyle = '#ffffff';
   ctx.fillRect(-86, -28, 172, 32);
   ctx.strokeStyle = '#000';
-  ctx.lineWidth = 2.5;
+  ctx.lineWidth = 2;
   ctx.strokeRect(-86, -28, 172, 32);
-  ctx.font = '900 30px "Arial Black", Impact, sans-serif';
+  ctx.font = '900 28px "Arial Black", Impact, sans-serif';
   ctx.textAlign = 'center';
   ctx.textBaseline = 'middle';
-  ctx.lineWidth = 3;
-  ctx.strokeStyle = '#000';
   ctx.fillStyle = '#000';
-  ctx.strokeText('POLICIJA', 0, -12);
   ctx.fillText('POLICIJA', 0, -12);
   ctx.textAlign = 'left';
   ctx.textBaseline = 'alphabetic';
