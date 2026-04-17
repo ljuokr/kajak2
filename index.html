@@ -929,16 +929,33 @@ function startMusic() {
   } catch (e) { /* ignore */ }
 
   masterGain = ac.createGain();
-  masterGain.gain.value = soundMuted ? 0 : 1;
   masterGain.connect(ac.destination);
+  // Initialen Pegel NICHT direkt per .value setzen — manche iOS-/Safari-Builds
+  // öffnen den Ausgang erst, wenn die Gain-Automation erstmals läuft (darum
+  // half bisher „Sound aus / wieder ein"). Ein 0 → 1 Ramp startet sie sofort.
+  masterGain.gain.cancelScheduledValues(ac.currentTime);
+  masterGain.gain.setValueAtTime(0, ac.currentTime);
+  masterGain.gain.linearRampToValueAtTime(soundMuted ? 0 : 1, ac.currentTime + 0.15);
 
   musicBus = ac.createGain();
-  musicBus.gain.value = 0.22;
+  musicBus.gain.setValueAtTime(0.22, ac.currentTime);
   musicBus.connect(masterGain);
 
   sfxBus = ac.createGain();
-  sfxBus.gain.value = 0.9;
+  sfxBus.gain.setValueAtTime(0.9, ac.currentTime);
   sfxBus.connect(masterGain);
+
+  // Priming: kurz Oscillator stumm durch die ganze Kette schicken, damit iOS
+  // den Ausgabe-Pfad definitiv aktiviert. Noch zuverlässiger als der
+  // empty-buffer-unlock an ac.destination allein.
+  try {
+    const primeOsc = ac.createOscillator();
+    const primeGain = ac.createGain();
+    primeGain.gain.setValueAtTime(0, ac.currentTime);
+    primeOsc.connect(primeGain); primeGain.connect(masterGain);
+    primeOsc.start(ac.currentTime);
+    primeOsc.stop(ac.currentTime + 0.05);
+  } catch (_) { /* ignore */ }
 
   // --- Wasser-/Wind-Rauschen als Dauer-Loop ---
   const noiseBuf = ac.createBuffer(2, ac.sampleRate * 4, ac.sampleRate);
