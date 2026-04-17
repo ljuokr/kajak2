@@ -128,6 +128,9 @@ let tick = 0;
 let camY = 0;
 let difficulty = 1;
 const keys = {ArrowLeft: false, ArrowRight: false, ArrowUp: false, ArrowDown: false};
+// Analoger Joystick (Paddel-Griff): Achsen in [-1..1]. joyActive = Finger aktiv.
+// joyX/joyY werden in der Dead-Zone auf 0 gesetzt, sonst weich von 0 bis ±1.
+let joyActive = false, joyX = 0, joyY = 0;
 
 let bananaCache = null, riegelCache = null;
 
@@ -1343,29 +1346,28 @@ cvs.addEventListener('touchend', e => {
   document.addEventListener(ev, startMusic, { passive: true, capture: true });
 });
 
-// On-Screen Joystick: Paddel als Griff. Finger-Position im Kreisfeld wird
-// auf Pfeiltasten gemappt (Dead-Zone in der Mitte, 8 Richtungen möglich).
-// Das Paddel wandert dem Finger nach und rotiert so, dass der Schaft in
-// Bewegungsrichtung zeigt — beim Loslassen schnappt es zurück ins Zentrum.
+// On-Screen Joystick: Paddel als Griff. Finger-Position im Kreisfeld liefert
+// analoge Achsen (joyX/joyY in [-1..1]); Dead-Zone ist weich rausgerechnet,
+// d.h. am Rand der Dead-Zone startet der Wert sanft bei 0 und steigt zum
+// Rand auf ±1. Das Paddel wandert dem Finger nach und rotiert so, dass der
+// Schaft in Zugrichtung zeigt — Loslassen schnappt zurück ins Zentrum.
 (function bindJoystick() {
   const joy = document.querySelector('.joystick');
   if (!joy) return;
   const svg = joy.querySelector('svg');
   const paddle = joy.querySelector('.paddle');
   if (!svg || !paddle) return;
-  const ALL_KEYS = ['ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight'];
-  const MAX_R = 70;            // SVG-Einheiten, max. Auslenkung
-  const DEAD_R = 18;           // SVG-Einheiten, Dead-Zone in der Mitte
-  const DIR_THRESHOLD = 0.22;  // Achsen-Schwelle (normiert 0..1)
+  const MAX_R = 70;    // SVG-Einheiten, max. Auslenkung
+  const DEAD_R = 14;   // SVG-Einheiten, Dead-Zone; kleiner als vorher, weil analog
   let activeId = null;
-
-  const clearKeys = () => ALL_KEYS.forEach(k => { keys[k] = false; });
 
   const reset = () => {
     activeId = null;
     joy.classList.remove('dragging');
     paddle.setAttribute('transform', 'translate(90 90)');
-    clearKeys();
+    joyActive = false;
+    joyX = 0;
+    joyY = 0;
   };
 
   const update = (clientX, clientY) => {
@@ -1383,14 +1385,14 @@ cvs.addEventListener('touchend', e => {
       'transform',
       `translate(${(90 + dx).toFixed(2)} ${(90 + dy).toFixed(2)}) rotate(${ang.toFixed(1)})`
     );
-    if (Math.hypot(dx, dy) < DEAD_R) {
-      clearKeys();
+    const m = Math.hypot(dx, dy);
+    if (m < DEAD_R) {
+      joyX = 0; joyY = 0;
     } else {
-      const nx = dx / MAX_R, ny = dy / MAX_R;
-      keys.ArrowLeft  = nx < -DIR_THRESHOLD;
-      keys.ArrowRight = nx >  DIR_THRESHOLD;
-      keys.ArrowUp    = ny < -DIR_THRESHOLD;
-      keys.ArrowDown  = ny >  DIR_THRESHOLD;
+      // Remap [DEAD_R..MAX_R] → [0..1] entlang der aktuellen Richtung.
+      const scale = (m - DEAD_R) / (MAX_R - DEAD_R);
+      joyX = (dx / m) * scale;
+      joyY = (dy / m) * scale;
     }
   };
 
@@ -1399,6 +1401,7 @@ cvs.addEventListener('touchend', e => {
     try { joy.setPointerCapture(e.pointerId); } catch (_) {}
     activeId = e.pointerId;
     joy.classList.add('dragging');
+    joyActive = true;
     update(e.clientX, e.clientY);
     startMusic();
   });
@@ -1441,17 +1444,35 @@ function handleInput() {
   const steerFactor = Math.max(0.5, 1.55 - fm * 0.55);
   const s = 2.75 * steerFactor;   // +25% Spieltempo
 
-  // Paddel-Rhythmus: Phase läuft nur, wenn tatsächlich gepaddelt wird.
+  // Eingabe-Achsen: Joystick analog ([-1..1]), Tastatur als ±1 (binär).
+  // Wenn der Joystick aktiv ist, übersteuert er die Tastatur.
+  let ax, ay;
+  if (joyActive) {
+    ax = joyX; ay = joyY;
+  } else {
+    ax = keys.ArrowRight ? 1 : keys.ArrowLeft ? -1 : 0;
+    ay = keys.ArrowDown  ? 1 : keys.ArrowUp   ? -1 : 0;
+  }
+  const forwardMag = Math.max(0, -ay);   // [0..1]
+  const reverseMag = Math.max(0,  ay);   // [0..1]
+  const steerMag   = Math.abs(ax);        // [0..1]
+
+  // Paddel-Rhythmus: Tempo und Amplitude skalieren mit der Input-Stärke.
   // Vorwärts = lange, ruhige Schläge; Rückwärts = kürzere, schnellere Schläge;
   // reine Lenkung = moderate Bewegung. Kein Input → Paddel gleitet in Ruhelage.
   if (typeof player.paddlePhase !== 'number' || !isFinite(player.paddlePhase)) player.paddlePhase = 0;
   if (typeof player.paddleAmp !== 'number' || !isFinite(player.paddleAmp)) player.paddleAmp = 0;
-  const steering = keys.ArrowLeft || keys.ArrowRight ||
-    (touchTargetX !== null && touchTargetY !== null);
   let stroke = 0, targetAmp = 0;
-  if (keys.ArrowUp) { stroke = 0.14; targetAmp = MAX_PADDLE; }
-  else if (keys.ArrowDown) { stroke = 0.28; targetAmp = MAX_PADDLE * 0.55; }
-  else if (steering) { stroke = 0.17; targetAmp = MAX_PADDLE * 0.85; }
+  if (forwardMag > 0.05) {
+    stroke    = 0.14 * forwardMag;
+    targetAmp = MAX_PADDLE * forwardMag;
+  } else if (reverseMag > 0.05) {
+    stroke    = 0.28 * reverseMag;
+    targetAmp = MAX_PADDLE * 0.55 * reverseMag;
+  } else if (steerMag > 0.05) {
+    stroke    = 0.17 * steerMag;
+    targetAmp = MAX_PADDLE * 0.85 * steerMag;
+  }
   if (stroke > 0) {
     player.paddlePhase += stroke;
     player.paddleAmp = player.paddleAmp * 0.7 + targetAmp * 0.3;
@@ -1461,9 +1482,9 @@ function handleInput() {
     player.paddlePhase = player.paddlePhase * 0.88 + nearestZero * 0.12;
   }
 
-  if (keys.ArrowLeft) player.vx = -s;
-  else if (keys.ArrowRight) player.vx = s;
-  else player.vx = 0;
+  // Seitensteuerung linear mit der Horizontal-Achse.
+  player.vx = ax * s;
+
   // Ufer-Relativ-Speed koppelt stark an die Strömung.
   // Vorwärts: Paddeleffekt + 1.6×Flow — in Stromschnellen spürbar schneller.
   // Rückwärts: FIXER Paddel-Effort (entspricht ~Level-2-Normalströmung). Strömung
@@ -1472,11 +1493,19 @@ function handleInput() {
   //              Level 2 (1.3×) → vy ≈ 0 → Stillstand
   //              Level 3 (2.1×) → vy < 0 aber stark gebremst → Verlangsamung
   //              Level 4 (2.9×) → noch immer forward, deutlich langsamer als Drift
-  if (keys.ArrowUp) player.vy = -2.0 + flow * 1.6;
-  else if (keys.ArrowDown) player.vy = -BASE_FLOW * 1.3 + flow;
-  else player.vy = flow;
+  // Analog: zwischen „kein Zug" (= flow) und vollem Zug wird linear gemischt.
+  if (forwardMag > 0.05) {
+    const full = -2.0 + flow * 1.6;
+    player.vy = flow + (full - flow) * forwardMag;
+  } else if (reverseMag > 0.05) {
+    const full = -BASE_FLOW * 1.3 + flow;
+    player.vy = flow + (full - flow) * reverseMag;
+  } else {
+    player.vy = flow;
+  }
 
-  if (touchTargetX !== null && touchTargetY !== null) {
+  // Canvas-Tap-Navigation: nur wenn Joystick ruht (sonst konkurrieren beide).
+  if (!joyActive && touchTargetX !== null && touchTargetY !== null) {
     const dx = touchTargetX - player.x;
     const dy = touchTargetY - player.y;
     const dist = Math.sqrt(dx * dx + dy * dy);
