@@ -701,7 +701,7 @@ function checkCollection() {
       const dy = Math.abs(player.y - item.y);
       if (dx < (item.w + player.w) / 2 && dy < (item.h + player.h) / 2) {
         item.collected = true;
-        const pts = item.type === 'banana' ? 5 : 20;
+        const pts = item.type === 'banana' ? 10 : 25;
         score += pts;
         scorePops.push({ x: item.x, y: item.y, t: tick, pts });
         playNamNam();
