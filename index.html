@@ -2,21 +2,21 @@
 <html lang="de">
 <head>
   <meta charset="UTF-8">
-  <title>Kajak 3 · Baby an Bord</title>
+  <title>Final Challenge</title>
   <meta name="viewport" content="width=device-width,initial-scale=1">
   <meta name="description" content="Fahrt durch die Stromschnellen ohne zu kentern und findet den geheimen Code!">
   <!-- Share-Preview: og/twitter-Tags nehmen diese Werte beim Weiterleiten
        (Slack/WhatsApp/iMessage/Twitter/etc.) statt nur dem <title>. -->
-  <meta property="og:title" content="Kajak 3 · Baby an Bord">
+  <meta property="og:title" content="Final Challenge">
   <meta property="og:description" content="Fahrt durch die Stromschnellen ohne zu kentern und findet den geheimen Code!">
   <meta property="og:type" content="website">
   <meta property="og:url" content="https://ljuokr.github.io/kajak2/">
   <meta property="og:image" content="https://ljuokr.github.io/kajak2/preview.png">
   <meta property="og:image:width" content="1200">
   <meta property="og:image:height" content="630">
-  <meta property="og:image:alt" content="Kajak auf Stromschnellen — Kajak 3 · Baby an Bord">
+  <meta property="og:image:alt" content="Kajak auf Stromschnellen — Final Challenge">
   <meta name="twitter:card" content="summary_large_image">
-  <meta name="twitter:title" content="Kajak 3 · Baby an Bord">
+  <meta name="twitter:title" content="Final Challenge">
   <meta name="twitter:description" content="Fahrt durch die Stromschnellen ohne zu kentern und findet den geheimen Code!">
   <meta name="twitter:image" content="https://ljuokr.github.io/kajak2/preview.png">
   <style>
@@ -132,7 +132,7 @@
 <div id="welcome" role="dialog" aria-modal="true" aria-labelledby="welcome-title">
   <div class="welcome-card">
     <div class="family-icon" aria-hidden="true">🛶</div>
-    <h1 id="welcome-title">Baby an Bord.</h1>
+    <h1 id="welcome-title">Final Challenge</h1>
     <p>Ins Flussabenteuer! Sammelt Proviant, umfahrt Felsen und entschlüsselt den geheimen Code für die Schatzkiste.</p>
     <p class="controls">Mit den Pfeiltasten steuern: ← ↑ ↓ →</p>
     <button id="sound-start-btn" type="button" aria-pressed="false" aria-describedby="iphone-sound-hint sound-status">
@@ -189,6 +189,7 @@ const policeBoats = [];
 let lives = 3;
 let score = 0;
 let secretsRevealed = 0;
+let treasureUnlocked = false, victoryAtTick = -1;
 let distance = 0;
 let startY = 0;
 let gameOver = false;
@@ -330,7 +331,7 @@ function obbOverlap(ax, ay, aw, ah, aRot, bx, by, bw, bh, bRot) {
   return true;
 }
 
-const HULL_CONTACT_LIMIT = 22; // 0.37 s at 60 Hz: enough time to correct a brush.
+const HULL_CONTACT_LIMIT = 16; // 0.27 s at 60 Hz: brief brushes remain recoverable; sustained contact capsizes sooner.
 function resetHullContact() {
   player.contactTicks = 0;
   player.contactLastTick = -1;
@@ -556,6 +557,7 @@ function resetPlayer() {
   player.invulnerable = false; player.invulnerableTime = 0;
   player.paddlePhase = 0; player.paddleAmp = 0;
   lives = 3; score = 0; secretsRevealed = 0; gameOver = false;
+  treasureUnlocked = false; victoryAtTick = -1;
   distance = 0;
   startY = player.y;
   difficulty = computeDifficulty();
@@ -835,6 +837,17 @@ function checkPoliceBoatCollision() {
   checkCollisions();
 }
 
+function updateCodeProgress() {
+  const reached = [100, 200, 300].filter(n => score >= n).length;
+  if (reached <= secretsRevealed || gameOver) return;
+  secretsRevealed = reached;
+  if (reached === 3) {
+    treasureUnlocked = true;
+    victoryAtTick = tick;
+    playVictoryHorn();
+  } else playFanfare();
+}
+
 function checkCollection() {
   collectibles.forEach(item => {
     // Float with the same curved current and return eddies as the kayak.
@@ -847,7 +860,7 @@ function checkCollection() {
     if (item.x < L + 20) item.x = L + 20;
     if (item.x > R - 20) item.x = R - 20;
 
-    if (!item.collected && !player.capsized) {
+    if (!item.collected && !player.capsized && !gameOver) {
       const dx = Math.abs(player.x - item.x);
       const dy = Math.abs(player.y - item.y);
       if (dx < (item.w + player.w) / 2 && dy < (item.h + player.h) / 2) {
@@ -859,6 +872,7 @@ function checkCollection() {
       }
     }
   });
+  updateCodeProgress();
   for (let i = collectibles.length - 1; i >= 0; i--) {
     if (collectibles[i].collected || collectibles[i].y - camY < -PAD || collectibles[i].y - camY > HEIGHT + PAD) {
       collectibles.splice(i, 1);
@@ -1261,6 +1275,37 @@ function playFanfare() {
   if (!audioCanPlay()) return;
   const t = musicCtx.currentTime;
   [293.66, 440, 587.33, 739.99, 880].forEach((f, i) => audioTone(f, t + i * 0.14, i === 4 ? 0.85 : 0.28, 0.18, sfxBus, 'triangle'));
+}
+function playVictoryHorn() {
+  if (!audioCanPlay() || !sfxBus) return;
+  const ac = musicCtx, t = ac.currentTime + 0.025;
+  // Kurzer Hornruf mit einem gehaltenen Dur-Akkord als Abschluss.
+  // Sechs begrenzte Stimmen laufen im bestehenden Audiographen mit aus.
+  const hornNote = (frequency, offset, duration, gain) => {
+    const when = t + offset, osc = ac.createOscillator();
+    const filter = ac.createBiquadFilter(), envelope = ac.createGain();
+    osc.type = 'sawtooth';
+    osc.frequency.setValueAtTime(frequency * 0.992, when);
+    osc.frequency.exponentialRampToValueAtTime(frequency, when + 0.045);
+    filter.type = 'lowpass'; filter.Q.value = 0.55;
+    filter.frequency.setValueAtTime(frequency * 2, when);
+    filter.frequency.exponentialRampToValueAtTime(frequency * 6, when + 0.06);
+    filter.frequency.exponentialRampToValueAtTime(frequency * 2.5, when + duration);
+    envelope.gain.setValueAtTime(0, when);
+    envelope.gain.linearRampToValueAtTime(gain, when + 0.035);
+    envelope.gain.linearRampToValueAtTime(gain * 0.76, when + duration * 0.55);
+    envelope.gain.linearRampToValueAtTime(gain * 0.68, when + duration * 0.78);
+    envelope.gain.linearRampToValueAtTime(0, when + duration);
+    osc.connect(filter); filter.connect(envelope); envelope.connect(sfxBus);
+    osc.onended = () => { osc.disconnect(); filter.disconnect(); envelope.disconnect(); };
+    osc.start(when); osc.stop(when + duration + 0.025);
+  };
+  hornNote(293.66, 0, 0.24, 0.2);
+  hornNote(293.66, 0.29, 0.2, 0.18);
+  hornNote(440, 0.54, 0.32, 0.21);
+  hornNote(587.33, 0.93, 1.15, 0.19);
+  hornNote(369.99, 0.93, 1.15, 0.1);
+  hornNote(440, 0.93, 1.15, 0.09);
 }
 function playGameOverSound() {
   if (!audioCanPlay()) return;
@@ -2587,6 +2632,95 @@ function drawScorePops() {
   ctx.textAlign = 'left';
 }
 
+// Screen coordinates; visible bounds are x ±66 and y -47…43 at scale 1.
+// `shine` is an optional animation phase; this helper has no gameplay state.
+function drawOpenTreasureChest(x, y, scale = 1, shine = 0) {
+  ctx.save(); ctx.translate(x, y); ctx.scale(scale, scale);
+  ctx.lineJoin = 'round'; ctx.lineCap = 'round';
+  const polygon = (points, fill, stroke = null, width = 1) => {
+    ctx.beginPath(); points.forEach(([px, py], i) => i ? ctx.lineTo(px, py) : ctx.moveTo(px, py));
+    ctx.closePath(); ctx.fillStyle = fill; ctx.fill();
+    if (stroke) { ctx.strokeStyle = stroke; ctx.lineWidth = width; ctx.stroke(); }
+  };
+  const line = (points, color, width = 1) => {
+    ctx.beginPath(); points.forEach(([px, py], i) => i ? ctx.lineTo(px, py) : ctx.moveTo(px, py));
+    ctx.strokeStyle = color; ctx.lineWidth = width; ctx.stroke();
+  };
+  ctx.fillStyle = 'rgba(34,47,37,.22)';
+  ctx.beginPath(); ctx.ellipse(3, 35, 56, 8, 0, 0, Math.PI * 2); ctx.fill();
+
+  // The raised lid exposes its warm, dark interior above the gold-filled mouth.
+  const lid = ctx.createLinearGradient(0, -43, 0, -11);
+  lid.addColorStop(0, '#b6703d'); lid.addColorStop(.35, '#8f4b2d'); lid.addColorStop(1, '#653b2b');
+  polygon([[-46,-42],[36,-42],[53,-12],[-33,-16]], lid, '#513c2a', 2.2);
+  polygon([[-41,-37],[32,-37],[44,-17],[-30,-20]], '#58372b', '#dcad5b', 2);
+  polygon([[-36,-34],[29,-34],[38,-20],[-28,-23]], '#71412f');
+  line([[-36,-29],[32,-28]], 'rgba(219,159,95,.25)', 1);
+  line([[-41,-41],[34,-41]], '#f1ce7c', 2);
+  // Brass reinforcement continues across lid and base.
+  for (const sx of [-25, 24]) {
+    polygon([[sx,-42],[sx+7,-42],[sx+21,-14],[sx+14,-14]], '#c39748', '#7b582d', .8);
+    line([[sx+1,-40],[sx+14,-17]], '#efd28b', 1.4);
+    ctx.fillStyle = '#5b452b';
+    for (const t of [.17,.78]) {
+      ctx.beginPath(); ctx.arc(sx + 3.5 + t * 14, -42 + t * 28, 1, 0, Math.PI * 2); ctx.fill();
+    }
+  }
+  polygon([[-35,-17],[53,-12],[43,7],[-49,-1]], '#d0a65a', '#60432a', 1.7);
+  polygon([[-33,-12],[46,-8],[38,2],[-41,-3]], '#342a24');
+
+  // Several overlapping coins remain legible even in the compact HUD version.
+  const coins = [[-29,-6,7],[25,-5,7],[-9,-8,7],[9,-7,7],[-19,-2,8],[0,-2,8],[18,-1,8],[32,0,6],[-32,0,6],[8,3,7],[-8,3,7]];
+  for (const [cx,cy,r] of coins) {
+    ctx.fillStyle = '#ac762b'; ctx.beginPath(); ctx.ellipse(cx,cy+1.8,r,r*.47,0,0,Math.PI*2); ctx.fill();
+    const gold = ctx.createLinearGradient(cx,cy-4,cx,cy+3);
+    gold.addColorStop(0,'#fff0a0'); gold.addColorStop(.38,'#f3cd5e'); gold.addColorStop(1,'#d39836');
+    ctx.fillStyle = gold; ctx.beginPath(); ctx.ellipse(cx,cy,r,r*.47,0,0,Math.PI*2); ctx.fill();
+    ctx.strokeStyle = '#bd8b38'; ctx.lineWidth = .7; ctx.stroke();
+    ctx.strokeStyle = '#fff4bc'; ctx.beginPath(); ctx.ellipse(cx,cy-.3,r*.65,r*.27,0,Math.PI*1.08,Math.PI*1.89); ctx.stroke();
+  }
+  // A small emerald gives the exposed treasure a clear focal point.
+  polygon([[20,-13],[26,-11],[26,-5],[19,-3],[15,-7]], '#439b85', '#265f57', .8);
+  polygon([[20,-13],[21,-7],[15,-7]], '#a4e0b4');
+  polygon([[21,-7],[26,-11],[26,-5],[19,-3]], '#327769');
+
+  const timber = ctx.createLinearGradient(0,5,0,37);
+  timber.addColorStop(0,'#b9703e'); timber.addColorStop(.47,'#9a512e'); timber.addColorStop(1,'#773e2a');
+  polygon([[-49,-1],[43,7],[42,36],[-46,29]], timber, '#503829', 2);
+  polygon([[43,7],[53,-12],[52,20],[42,36]], '#70422c', '#503829', 1.8);
+  line([[46,8],[50,0],[49,19],[45,27]], '#986333', 1);
+  for (const py of [9,20]) {
+    line([[-46,py],[41,py+7]], '#653e2a', 1);
+    line([[-44,py+1],[39,py+7.7]], 'rgba(229,162,94,.35)', .8);
+  }
+  line([[-38,16],[-16,17.5],[-6,17]], 'rgba(63,40,25,.3)', .8);
+  line([[13,28],[27,29],[35,28.5]], 'rgba(235,178,109,.35)', .8);
+  for (const sx of [-34,26]) {
+    polygon([[sx,1+(sx+49)*.087],[sx+7,1+(sx+56)*.087],[sx+7,35+(sx-26)*.076],[sx,34.5+(sx-26)*.076]], '#c2974d', '#704e2c', .8);
+    line([[sx+1,5+(sx+49)*.07],[sx+1,29+(sx+49)*.08]], '#f1d18a', 1.3);
+    ctx.fillStyle = '#684a2a';
+    for (const py of [9,28]) { ctx.beginPath(); ctx.arc(sx+3.5,py+(sx+34)*.08,1,0,Math.PI*2); ctx.fill(); }
+  }
+  // Thick rim, lower brass edge and opened clasp define the chest silhouette.
+  line([[-48,0],[43,8],[52,-9]], '#efd087', 3);
+  line([[-45,28],[41,35],[51,20]], '#be9046', 2.6);
+  polygon([[-7,5],[7,6],[7,15],[-7,14]], '#dcb663', '#72512a', 1);
+  polygon([[-3,7],[3,7.6],[3,12],[-3,11.5]], '#65472a');
+  line([[-5,5],[-4,1],[5,2],[6,6]], '#ffe5a0', 1.7);
+
+  // Restrained four-point glints never obscure the chest or nearby code digits.
+  if (shine > 0) {
+    const baseAlpha = ctx.globalAlpha;
+    const glints = [[-59,-17,4.4,0],[60,-29,5.3,1.8],[4,-44,2.7,3.4]];
+    for (const [sx,sy,r,phase] of glints) {
+      const pulse = .6 + .4 * Math.sin(shine + phase);
+      ctx.globalAlpha = baseAlpha * (.45 + pulse * .5);
+      polygon([[sx,sy-r],[sx+r*.25,sy-r*.25],[sx+r,sy],[sx+r*.25,sy+r*.25],[sx,sy+r],[sx-r*.25,sy+r*.25],[sx-r,sy],[sx-r*.25,sy-r*.25]], '#fff0ab');
+    }
+  }
+  ctx.restore();
+}
+
 function drawHUD() {
   document.querySelector('.joystick').hidden = paused || gameOver || !hasStarted;
   ctx.save();ctx.textBaseline='middle';ctx.lineJoin='round';
@@ -2614,15 +2748,31 @@ function drawHUD() {
   ctx.beginPath();ctx.moveTo(18,67);ctx.lineTo(24,67);ctx.lineTo(31,61);ctx.lineTo(31,79);ctx.lineTo(24,73);ctx.lineTo(18,73);ctx.closePath();ctx.stroke();
   if(soundMuted){ctx.beginPath();ctx.moveTo(35,65);ctx.lineTo(41,75);ctx.moveTo(41,65);ctx.lineTo(35,75);ctx.stroke();}
   else{ctx.beginPath();ctx.arc(30,70,9,-.8,.8);ctx.stroke();}
-  panel(80,94,230,48);ctx.textAlign='center';ctx.font='700 11px system-ui';ctx.fillStyle='#c0ddd2';ctx.fillText('CODE',109,118);
-  const reached=[100,200,300].filter(n=>score>=n).length;
-  if(reached>secretsRevealed){secretsRevealed=reached;playFanfare();}
+  panel(80,94,treasureUnlocked?302:230,48);ctx.textAlign='center';ctx.font='700 11px system-ui';ctx.fillStyle='#c0ddd2';ctx.fillText('CODE',109,118);
   for(let i=0;i<3;i++){
-    const x=169+i*44,unlocked=score>=[100,200,300][i];
+    const x=169+i*44,unlocked=secretsRevealed>i;
     ctx.fillStyle=unlocked?'rgba(255,219,160,.13)':'rgba(223,247,233,.045)';
     ctx.beginPath();ctx.roundRect(x-18,100,36,36,7);ctx.fill();
     ctx.fillStyle=unlocked?'#ffe0a2':'#7e9d91';ctx.font='750 28px system-ui';
     ctx.fillText(unlocked?'324'[i]:'·',x,119);
+  }
+  if(treasureUnlocked){
+    drawOpenTreasureChest(339,119,.44,tick/60);
+    if(!gameOver && tick-victoryAtTick<240){
+      // Celebrate behind the kayak, leaving the route ahead and paddle clear.
+      const age=tick-victoryAtTick;
+      ctx.save();ctx.globalAlpha=Math.min(1,(240-age)/30);
+      const y=HEIGHT-390;
+      panel(48,y,294,166);
+      ctx.strokeStyle='rgba(243,196,103,.65)';ctx.lineWidth=1.5;
+      ctx.beginPath();ctx.roundRect(48,y,294,166,11);ctx.stroke();
+      ctx.textAlign='center';ctx.fillStyle='#ffe0a2';ctx.font='800 19px system-ui';
+      ctx.fillText('CODE GEKNACKT!',WIDTH/2,y+23);
+      drawOpenTreasureChest(WIDTH/2,y+87,1,tick/60);
+      ctx.fillStyle='#f3efcf';ctx.font='600 12px system-ui';
+      ctx.fillText('Die Schatzkiste ist offen.',WIDTH/2,y+148);
+      ctx.restore();
+    }
   }
   if(gameOver){
     panel(32,HEIGHT-240,WIDTH-64,132);ctx.fillStyle='#ffdbaf';ctx.font='750 26px system-ui';ctx.fillText('GAME OVER',WIDTH/2,HEIGHT-212);
@@ -3390,7 +3540,8 @@ window.render_game_to_text = () => JSON.stringify({
   baby: {present:true, location:gameOver ? 'on own cushion beside parents on shore' : player.capsized ? 'with parent in flotation ring' : 'centre seat',lifeJacket:true},
   ending: gameOver ? {title:'GAME OVER', arrangement:'separated campsite with beer and fire', shore:getBeachLayout(), kayakDrifting:true, paddle:{x:player.paddleX,y:player.paddleY}} : null,
   current:sampleCurrent(player.x,player.y), audio:getAudioStatus(),
-  muted:soundMuted, code: [100,200,300].map((n,i)=>score>=n ? '324'[i] : '?').join(''),
+  muted:soundMuted, code: [0,1,2].map(i=>secretsRevealed>i ? '324'[i] : '?').join(''),
+  victory: {unlocked:treasureUnlocked,chest:treasureUnlocked?'open':'hidden',celebrating:treasureUnlocked&&!gameOver&&tick-victoryAtTick<240},
   obstacles:obstacles.filter(o=>Math.abs(o.y-player.y)<420).map(o=>({type:o.type,x:o.x,y:o.y,r:o.rad,w:o.len,h:o.wd})),
   collectibles:collectibles.filter(o=>Math.abs(o.y-player.y)<420).map(o=>({type:o.type,x:o.x,y:o.y})),
   policeBoats:policeBoats.map(o=>({x:o.x,y:o.y})),
