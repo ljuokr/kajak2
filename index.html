@@ -105,10 +105,8 @@
     #sound-start-btn[aria-pressed="true"] { background: #d4eee2; border-color: #408069; }
     #sound-start-btn:focus-visible { outline: 3px solid #147b87; outline-offset: 4px; }
     #sound-start-btn .sound-glyph { font-size: 27px; line-height: 1; }
-    #sound-start-btn small { display: block; font: 600 10px system-ui; margin-top: 3px; opacity: .78; }
-    #sound-status { min-height: 15px; font-size: 10px; line-height: 1.4; margin: -3px 0 12px; color: #426268; }
     #iphone-sound-hint { margin: -3px 0 10px; font-size: 12px; font-weight: 750; line-height: 1.4; color: #173f45; }
-    @media (max-height: 640px) { #welcome { overflow-y: auto; } .welcome-card { margin: auto; } #sound-start-btn { min-height: 54px; padding: 9px 12px; margin-bottom: 8px; } #sound-status { margin-bottom: 8px; } }
+    @media (max-height: 640px) { #welcome { overflow-y: auto; } .welcome-card { margin: auto; } #sound-start-btn { min-height: 54px; padding: 9px 12px; margin-bottom: 8px; } }
     #start-btn { width: 100%; padding: 15px; border: 0; border-radius: 14px; background: #c84924; color: white; font: 750 16px system-ui; cursor: pointer; }
     #start-btn:hover { background: #a93818; }
     #start-btn:focus-visible { outline: 3px solid #147b87; outline-offset: 4px; }
@@ -122,7 +120,6 @@
       .welcome-card .crew, .welcome-card .footnote { display: none; }
       .welcome-card .controls { font-size: 10px; margin: 7px 0; }
       #sound-start-btn { min-height: 46px; padding: 8px; margin: 0 0 6px; font-size: 15px; }
-      #sound-status { font-size: 9px; margin-bottom: 6px; }
       #start-btn { padding: 11px; }
     }
   </style>
@@ -135,12 +132,11 @@
     <h1 id="welcome-title">Final Challenge</h1>
     <p>Ins Flussabenteuer! Sammelt Proviant, umfahrt Felsen und entschlüsselt den geheimen Code für die Schatzkiste.</p>
     <p class="controls">Mit den Pfeiltasten steuern: ← ↑ ↓ →</p>
-    <button id="sound-start-btn" type="button" aria-pressed="false" aria-describedby="iphone-sound-hint sound-status">
+    <button id="sound-start-btn" type="button" aria-pressed="false" aria-describedby="iphone-sound-hint">
       <span class="sound-glyph" aria-hidden="true">🔊</span>
-      <span><span id="sound-label">Sound einschalten</span><small id="sound-detail">Drunken Sailor &amp; Flussklänge</small></span>
+      <span id="sound-label">Sound einschalten</span>
     </button>
-    <p id="iphone-sound-hint">iPhone: Klingelton einschalten<br>– Stummmodus aus.</p>
-    <p id="sound-status" role="status" aria-live="polite">Einmal antippen und Musik &amp; Flussklänge hören.</p>
+    <p id="iphone-sound-hint">iPhone: Klingelton einschalten</p>
     <button id="start-btn">Leinen los →</button>
   </div>
 </div>
@@ -1112,8 +1108,6 @@ function syncSoundUI() {
   btn.setAttribute('aria-pressed', String(ready));
   btn.setAttribute('aria-busy', String(audioPending));
   document.getElementById('sound-label').textContent = audioPending ? 'Sound wird aktiviert …' : ready ? 'Sound an ✓' : 'Sound einschalten';
-  document.getElementById('sound-detail').textContent = ready ? 'Drunken Sailor · Antippen zum Stummschalten' : 'Drunken Sailor & Flussklänge';
-  document.getElementById('sound-status').textContent = audioError || (audioPending ? 'Audio wird gestartet …' : ready ? 'Bereit! Lautstärke am Gerät einstellen.' : !soundMuted ? 'Zum Fortsetzen Sound noch einmal antippen.' : 'Einmal antippen und Musik & Flussklänge hören.');
 }
 
 function audioCanPlay() { return !soundMuted && musicCtx?.state === 'running' && !document.hidden; }
