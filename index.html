@@ -173,7 +173,8 @@ const player = {
   x: 0, y: 0, w: 30, h: 68,
   vx: 0, vy: 0,
   capsized: false, capsizeTime: 0,
-  invulnerable: false, invulnerableTime: 0
+  invulnerable: false, invulnerableTime: 0,
+  contactTicks: 0, contactLastTick: -1, contactKind: ''
 };
 const obstacles = [];
 const trees = [];
@@ -275,15 +276,17 @@ const purge = arr => {
 };
 
 function isPlayerInWater() {
-  const [L, R] = waterEdges(player.y);
+  // Check the tapered hull at each river cross-section, with a small brush margin.
   const points = [
-    { x: player.x, y: player.y },
-    { x: player.x - player.w/2, y: player.y - player.h/2 },
-    { x: player.x + player.w/2, y: player.y - player.h/2 },
-    { x: player.x - player.w/2, y: player.y + player.h/2 },
-    { x: player.x + player.w/2, y: player.y + player.h/2 }
+    { x: player.x - player.w / 2 + 2, y: player.y },
+    { x: player.x + player.w / 2 - 2, y: player.y },
+    { x: player.x - player.w * .23, y: player.y - player.h * .45 },
+    { x: player.x + player.w * .23, y: player.y - player.h * .45 },
+    { x: player.x - player.w * .23, y: player.y + player.h * .45 },
+    { x: player.x + player.w * .23, y: player.y + player.h * .45 }
   ];
   for (let p of points) {
+    const [L, R] = waterEdges(p.y);
     if (p.x <= L || p.x >= R) return false;
   }
   return true;
@@ -325,38 +328,78 @@ function obbOverlap(ax, ay, aw, ah, aRot, bx, by, bw, bh, bRot) {
   return true;
 }
 
-function checkCollisions() {
-  if (player.capsized || gameOver || player.invulnerable) return;
+const HULL_CONTACT_LIMIT = 22; // 0.37 s at 60 Hz: enough time to correct a brush.
+function resetHullContact() {
+  player.contactTicks = 0;
+  player.contactLastTick = -1;
+  player.contactKind = '';
+}
 
+function findHullContact() {
+  const awayFrom = (x, y, kind) => {
+    const dx = player.x - x, dy = player.y - y, length = Math.hypot(dx, dy);
+    return {kind, nx: length > .01 ? dx / length : 1, ny: length > .01 ? dy / length : 0};
+  };
   if (!isPlayerInWater()) {
-    capsizeKayak();
-    return;
+    const [L, R] = waterEdges(player.y);
+    return {kind: 'bank', nx: player.x < (L + R) / 2 ? 1 : -1, ny: 0};
   }
-
   for (let o of obstacles) {
     if (o.type === 'rock') {
       const dx = player.x - o.x;
       const dy = player.y - o.y;
       const nearX = Math.max(0, Math.abs(dx) - player.w * 0.4);
       const nearY = Math.max(0, Math.abs(dy) - player.h * 0.4);
-      if (nearX * nearX + nearY * nearY < o.rad * o.rad) {
-        capsizeKayak();
-        return;
+      const radius = Math.max(1, o.rad - 2);
+      if (nearX * nearX + nearY * nearY < radius * radius) {
+        return awayFrom(o.x, o.y, 'rock');
       }
     } else if (o.type === 'log') {
       const logX = o.x + Math.sin(tick * 0.05 + o.phase) * 2;
       if (obbOverlap(
         logX, o.y, o.len, o.wd, o.rot,
-        player.x, player.y, player.w, player.h, 0
+        player.x, player.y, player.w - 4, player.h - 6, 0
       )) {
-        capsizeKayak();
-        return;
+        return awayFrom(logX, o.y, 'log');
       }
     }
   }
+  for (const boat of policeBoats) {
+    if (Math.abs(player.x - boat.x) < (boat.w + player.w) / 2 - 2 &&
+        Math.abs(player.y - boat.y) < (boat.h + player.h) / 2 - 3) {
+      return awayFrom(boat.x, boat.y, 'police');
+    }
+  }
+  return null;
+}
+
+function checkCollisions() {
+  if (player.capsized || gameOver || player.invulnerable) {
+    resetHullContact();
+    return;
+  }
+  // All physical obstacles share one decision per simulation tick.
+  if (player.contactLastTick === tick) return;
+  player.contactLastTick = tick;
+  const contact = findHullContact();
+  if (!contact) {
+    player.contactTicks = Math.max(0, player.contactTicks - 2);
+    if (!player.contactTicks) player.contactKind = '';
+    return;
+  }
+  if (!player.contactTicks) {
+    player.vx += contact.nx * .8;
+    player.vy += contact.ny * .65;
+    splashes.push({x: player.x + contact.nx * 13, y: player.y + contact.ny * 25,
+      vx: 0, vy: 0, life: 18, maxLife: 18, r: 3, kind: 'ring'});
+  }
+  player.contactKind = contact.kind;
+  player.contactTicks++;
+  if (player.contactTicks >= HULL_CONTACT_LIMIT) capsizeKayak();
 }
 
 function capsizeKayak() {
+  resetHullContact();
   player.capsized = true;
   player.capsizeTime = tick;
   lives--;
@@ -503,6 +546,7 @@ function setSize() {
 }
 
 function resetPlayer() {
+  resetHullContact();
   player.x = WIDTH / 2;
   player.y = HEIGHT / 2 + 200;
   player.vx = 0; player.vy = 0;
@@ -533,7 +577,7 @@ let encounterClock = 0, encounterLastDistance = 0;
 function encounterSpawnY() { return camY - rand(36, 126); }
 function resetEncounterPacing() {
   encounterClock = 0; encounterLastDistance = 0;
-  Object.assign(encounterNext, {rock:220, log:560, banana:160, riegel:310,
+  Object.assign(encounterNext, {rock:220, log:560, banana:160, riegel:230,
     fisherman:680, fish:430, police:1420});
 }
 function updateEncounterPacing() {
@@ -554,7 +598,7 @@ function updateEncounterPacing() {
   due('log', Math.max(400, 500 / encounterTempo), spawnLog,
     obstacles.filter(o => o.type === 'log').length < 2);
   due('banana', difficulty < 1 ? 250 : 320, spawnBanana, collectibles.length < 7);
-  due('riegel', difficulty < 1 ? 500 : 630, spawnRiegel, collectibles.length < 7);
+  due('riegel', difficulty < 1 ? 360 : 460, spawnRiegel, collectibles.length < 7);
   due('fisherman', 1500, spawnFisherman, fishermen.length < 2);
   due('fish', 1650, spawnFish, fishes.length < 1);
   // A patrol remains an event, with only one boat anywhere in the live strip.
@@ -785,16 +829,8 @@ function checkFishermanCollision() {
 }
 
 function checkPoliceBoatCollision() {
-  if (player.capsized || gameOver || player.invulnerable) return;
-  for (const boat of policeBoats) {
-    const dx = Math.abs(player.x - boat.x);
-    const dy = Math.abs(player.y - boat.y);
-    if (dx < (boat.w + player.w) / 2 && dy < (boat.h + player.h) / 2) {
-      lives = 1;
-      capsizeKayak();
-      return;
-    }
-  }
+  // Retain the interaction hook while sharing the same contact budget.
+  checkCollisions();
 }
 
 function checkCollection() {
@@ -860,7 +896,7 @@ function populate() {
     item.x = Math.max(L + margin, Math.min(R - margin, L + (R - L) * across));
   };
   provision(spawnBanana, 70, .5);
-  provision(spawnBanana, 145, .72);
+  provision(spawnRiegel, 145, .72);
   provision(spawnRiegel, 285, .48);
   provision(spawnBanana, 452, .3);
   spawnFisherman(player.y - 240);
@@ -990,6 +1026,24 @@ let audioTimer = null, audioHideTimer = null, audioNoiseBuffer = null;
 let nextMusicTime = 0, musicStep = 0, lastAudioMix = -Infinity, lastPaddleBeat = 0;
 let sirenActive = null;
 const audioTargets = new WeakMap();
+// Traditionelle Drunken-Sailor-Melodie aus der ursprünglichen Spielversion.
+// Acht Takte bei 100 BPM; der Scheduler plant jeweils nur die nächste Achtelnote.
+const SAILOR_BEAT = 60 / 100, SAILOR_STEPS = 64;
+const SAILOR_NOTES = {D2:73.4, C3:130.8, D3:146.8, E3:164.8, F3:175, G3:196, A3:220,
+  C4:261.6, D4:293.7, E4:329.6, F4:349.2, G4:392, A4:440, B4:493.9, C5:523.3, D5:587.3};
+const SAILOR_MELODY = [
+  ['A4',0,.5], ['A4',.5,.5], ['A4',1,.5], ['A4',1.5,.5],
+  ['A4',2,.5], ['A4',2.5,.5], ['D4',3,.5], ['F4',3.5,.5], ['A4',4,4],
+  ['G4',8,.5], ['G4',8.5,.5], ['G4',9,.5], ['G4',9.5,.5],
+  ['G4',10,.5], ['G4',10.5,.5], ['C4',11,.5], ['E4',11.5,.5], ['G4',12,4],
+  ['A4',16,.5], ['A4',16.5,.5], ['A4',17,.5], ['A4',17.5,.5],
+  ['A4',18,.5], ['B4',18.5,.5], ['C5',19,.5], ['D5',19.5,2.5],
+  ['A4',24,1], ['G4',25,1], ['F4',26,1], ['E4',27,1], ['D4',28,2], ['D4',30,2]
+].map(([note, beat, length]) => [SAILOR_NOTES[note], beat, length]);
+const SAILOR_BASS = ['D2','D2','C3','C3','D2','D2','C3','D2'].map(note => SAILOR_NOTES[note]);
+const SAILOR_CHORDS = ['Dm','Dm','C','C','Dm','Dm','C','Dm'].map(chord =>
+  (chord === 'Dm' ? ['D3','F3','A3'] : ['C3','E3','G3']).map(note => SAILOR_NOTES[note]));
+const sailorMelodySteps = new Map(SAILOR_MELODY.map(([frequency, beat, length]) => [beat * 2, {frequency, length}]));
 
 function audioRamp(param, target, seconds = 0.18) {
   if (!musicCtx || !param) return;
@@ -1048,7 +1102,7 @@ function syncSoundUI() {
 
 function audioCanPlay() { return !soundMuted && musicCtx?.state === 'running' && !document.hidden; }
 
-function audioTone(frequency, when, duration, gain = 0.13, bus = sfxBus, type = 'sine', endFrequency = frequency) {
+function audioTone(frequency, when, duration, gain = 0.13, bus = sfxBus, type = 'sine', endFrequency = frequency, sustain = false) {
   if (!audioCanPlay() || !bus) return;
   const ac = musicCtx, osc = ac.createOscillator(), envelope = ac.createGain();
   osc.type = type;
@@ -1056,6 +1110,7 @@ function audioTone(frequency, when, duration, gain = 0.13, bus = sfxBus, type = 
   if (endFrequency !== frequency) osc.frequency.exponentialRampToValueAtTime(endFrequency, when + duration);
   envelope.gain.setValueAtTime(0, when);
   envelope.gain.linearRampToValueAtTime(gain, when + Math.min(0.024, duration * 0.18));
+  if (sustain) envelope.gain.linearRampToValueAtTime(gain * 0.72, when + duration * 0.55);
   envelope.gain.exponentialRampToValueAtTime(0.0001, when + duration);
   osc.connect(envelope); envelope.connect(bus);
   osc.onended = () => { osc.disconnect(); envelope.disconnect(); };
@@ -1163,15 +1218,22 @@ function audioScheduler() {
   if (!audioCanPlay() || (hasStarted && paused)) { nextMusicTime = musicCtx.currentTime + 0.08; stopPoliceSiren(); return; }
   updatePoliceSiren();
   const now = musicCtx.currentTime;
-  if (nextMusicTime < now - 0.3) nextMusicTime = now + 0.06;
-  // Ruhige, eigene Fünf-Ton-Melodie; Wasser und Aktionen bleiben vorne.
-  const melody = [293.66, 0, 349.23, 440, 0, 392, 349.23, 0, 261.63, 0, 293.66, 349.23, 0, 293.66, 0, 0];
-  const harmony = [[146.83, 220], [130.81, 196], [174.61, 261.63], [146.83, 220]];
-  while (nextMusicTime < now + 0.2) {
-    const i = musicStep % melody.length;
-    if (melody[i]) audioTone(melody[i], nextMusicTime, 0.68, 0.075, musicBus, 'triangle');
-    if (musicStep % 4 === 0) harmony[Math.floor(musicStep / 4) % 4].forEach(f => audioTone(f, nextMusicTime, 2.3, 0.035, musicBus));
-    nextMusicTime += 0.75; musicStep++;
+  if (nextMusicTime < now - 0.15) nextMusicTime = now + 0.06;
+  // Kein ganzer Song im Voraus: auch nach einem langen Tab-Wechsel höchstens
+  // zwei Achtelschritte, ohne nachzuholende Noten oder zusätzliche Timer.
+  for (let scheduled = 0; nextMusicTime < now + 0.2 && scheduled < 2; scheduled++) {
+    const step = musicStep % SAILOR_STEPS, bar = Math.floor(step / 8), note = sailorMelodySteps.get(step);
+    if (note) audioTone(note.frequency, nextMusicTime, note.length * SAILOR_BEAT * 0.92,
+      0.135, musicBus, 'triangle', note.frequency, true);
+    if (step % 4 === 0) {
+      const bass = SAILOR_BASS[bar];
+      audioTone(bass, nextMusicTime, 2 * SAILOR_BEAT * 0.92, 0.065, musicBus, 'triangle', bass, true);
+      audioTone(125, nextMusicTime, 0.14, 0.075, musicBus, 'sine', 48);
+    }
+    if (step % 8 === 0) SAILOR_CHORDS[bar].forEach(f =>
+      audioTone(f, nextMusicTime, 4 * SAILOR_BEAT * 0.95, 0.028, musicBus, 'triangle', f, true));
+    nextMusicTime += SAILOR_BEAT / 2;
+    musicStep = (musicStep + 1) % SAILOR_STEPS;
   }
 }
 
@@ -1720,6 +1782,7 @@ function update() {
 
   if (player.capsized && tick - player.capsizeTime > 120) {
     player.capsized = false;
+    resetHullContact();
     const [L, R] = waterEdges(player.y);
     player.x = (L + R) / 2;
     player.invulnerable = true;
@@ -1738,7 +1801,6 @@ function update() {
   checkCollection();
   checkFishCollection();
   checkFishermanCollision();
-  checkPoliceBoatCollision();
 
   fishes.forEach(fish => {
     const dx = player.x - fish.x;
@@ -2244,6 +2306,12 @@ function drawKayak() {
   ctx.fillStyle = 'rgba(13,54,51,.24)';
   ctx.beginPath(); ctx.ellipse(player.x + 4, kayakY + 7, player.w / 2 + 3, player.h / 2 + 8, 0, 0, Math.PI * 2); ctx.fill();
   ctx.translate(player.x, kayakY);
+  if (!player.capsized && player.contactTicks > 0) {
+    // A brief amber water ripple warns of sustained contact without extra HUD text.
+    ctx.strokeStyle = `rgba(255,206,112,${.25 + player.contactTicks / HULL_CONTACT_LIMIT * .5})`;
+    ctx.lineWidth = 1.7;
+    ctx.beginPath(); ctx.ellipse(0, 0, player.w / 2 + 6, player.h / 2 + 12, 0, 0, Math.PI * 2); ctx.stroke();
+  }
   if (player.capsized) ctx.rotate(Math.PI / 4);
   if (!player.capsized && player.invulnerable && Math.floor(tick / 10) % 2 === 0) ctx.globalAlpha = .5;
   const halfW = player.w / 2, tip = player.h / 2 + 10;
@@ -3315,7 +3383,8 @@ window.render_game_to_text = () => JSON.stringify({
   version: 3, mode: !hasStarted ? 'start' : gameOver ? 'gameover' : paused ? 'paused' : player.capsized ? 'capsized' : 'playing',
   coordinates: 'World origin top-left; x right, y down; screenY = y - cameraY',
   tick, cameraY: camY, score, lives, distance: Math.floor(distance), difficulty,
-  player: {x:player.x,y:player.y,vx:player.vx,vy:player.vy,w:player.w,h:player.h,invulnerable:player.invulnerable},
+  player: {x:player.x,y:player.y,vx:player.vx,vy:player.vy,w:player.w,h:player.h,invulnerable:player.invulnerable,
+    contact: {kind:player.contactKind,ticks:player.contactTicks,limit:HULL_CONTACT_LIMIT}},
   baby: {present:true, location:gameOver ? 'on own cushion beside parents on shore' : player.capsized ? 'with parent in flotation ring' : 'centre seat',lifeJacket:true},
   ending: gameOver ? {title:'GAME OVER', arrangement:'separated campsite with beer and fire', shore:getBeachLayout(), kayakDrifting:true, paddle:{x:player.paddleX,y:player.paddleY}} : null,
   current:sampleCurrent(player.x,player.y), audio:getAudioStatus(),
