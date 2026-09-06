@@ -99,7 +99,6 @@
     h1 { font-size: 34px; letter-spacing: -1.5px; margin: 4px 0 14px; }
     p { line-height: 1.6; font-size: 14px; }
     .crew { padding: 12px 0; border-block: 1px solid #123d4320; font-size: 12px; font-weight: 750; }
-    .controls { font-size: 12px; color: #426268; }
     #sound-start-btn { width: 100%; min-height: 62px; margin: 0 0 12px; padding: 12px 14px; border: 2px solid #bc822b; border-radius: 14px; background: #ffe8a0; color: #173f45; font: 800 17px system-ui; cursor: pointer; display: flex; align-items: center; justify-content: center; gap: 12px; box-shadow: 0 3px 0 #c8994250; }
     #sound-start-btn:hover { background: #ffdf7c; }
     #sound-start-btn[aria-pressed="true"] { background: #d4eee2; border-color: #408069; }
@@ -112,13 +111,12 @@
     #start-btn:focus-visible { outline: 3px solid #147b87; outline-offset: 4px; }
     .footnote { display: block; margin-top: 14px; font-size: 10px; color: #426268; }
     @media (pointer: fine) { .joystick { opacity: .55; width: 135px; height: 135px; } .joystick:hover { opacity: 1; } }
-    @media (max-height: 580px) { .welcome-card { padding: 16px 22px; } .family-icon { display: none; } .controls { margin: 8px 0; } }
+    @media (max-height: 580px) { .welcome-card { padding: 16px 22px; } .family-icon { display: none; } }
     @media (max-height: 580px) {
       .welcome-card { padding: 14px 22px; }
       .welcome-card h1 { font-size: 27px; margin: 3px 0 7px; }
-      .welcome-card > p:not(.controls) { font-size: 12px; margin: 5px 0; }
+      .welcome-card > p { font-size: 12px; margin: 5px 0; }
       .welcome-card .crew, .welcome-card .footnote { display: none; }
-      .welcome-card .controls { font-size: 10px; margin: 7px 0; }
       #sound-start-btn { min-height: 46px; padding: 8px; margin: 0 0 6px; font-size: 15px; }
       #start-btn { padding: 11px; }
     }
@@ -131,7 +129,6 @@
     <div class="family-icon" aria-hidden="true">🛶</div>
     <h1 id="welcome-title">Final Challenge</h1>
     <p>Sammelt Proviant, umfahrt Felsen und entschlüsselt den geheimen Code für die Schatzkiste.</p>
-    <p class="controls">Mit den Pfeiltasten steuern: ← ↑ ↓ →</p>
     <button id="sound-start-btn" type="button" aria-pressed="false" aria-describedby="iphone-sound-hint">
       <span class="sound-glyph" aria-hidden="true">🔊</span>
       <span id="sound-label">Sound einschalten</span>
@@ -1012,7 +1009,7 @@ window.addEventListener('click', e => {
     e.preventDefault();
     return;
   }
-  // Klick auf Pause-Button (oben rechts)?
+  // Klick auf Pause-Button (oben links)?
   const pbX = 8, pbY = 8, pbW = 44, pbH = 36;
   if (cx >= pbX && cx <= pbX + pbW && cy >= pbY && cy <= pbY + pbH) {
     togglePause();
@@ -1365,7 +1362,7 @@ window.addEventListener('keydown', (e) => {
 });
 cvs.addEventListener('touchstart', startMusic, { passive: false });
 
-let touchTargetX = null, touchTargetY = null;
+// Canvas touches operate the HUD and restart only; steering uses keys or the paddle.
 cvs.addEventListener('touchstart', e => {
   e.preventDefault();
   const touch = e.touches[0];
@@ -1379,26 +1376,13 @@ cvs.addEventListener('touchstart', e => {
     toggleMute();
     return;
   }
-  // Pause-Button (oben rechts).
+  // Pause-Button (oben links).
   const pbX = 8, pbY = 8, pbW = 44, pbH = 36;
   if (tx >= pbX && tx <= pbX + pbW && ty >= pbY && ty <= pbY + pbH) {
     togglePause();
     return;
   }
   if (gameOver) { init(); return; }
-  touchTargetX = tx;
-  touchTargetY = ty + camY;
-}, { passive: false });
-cvs.addEventListener('touchmove', e => {
-  e.preventDefault();
-  const touch = e.touches[0];
-  const rect = cvs.getBoundingClientRect();
-  touchTargetX = (touch.clientX - rect.left) * (WIDTH / rect.width);
-  touchTargetY = (touch.clientY - rect.top) * (HEIGHT / rect.height) + camY;
-}, { passive: false });
-cvs.addEventListener('touchend', e => {
-  e.preventDefault();
-  touchTargetX = null; touchTargetY = null;
 }, { passive: false });
 
 // Bereits eingeschalteten Ton nach einem Geräte-/Tab-Unterbruch wieder freigeben.
@@ -1633,14 +1617,6 @@ function handleInput() {
   } else {
     ax = keys.ArrowRight ? 1 : keys.ArrowLeft ? -1 : 0;
     ay = keys.ArrowDown  ? 1 : keys.ArrowUp   ? -1 : 0;
-  }
-  // Tap navigation uses the same paddle forces and animation as other controls.
-  if (!joyActive && touchTargetX !== null && touchTargetY !== null) {
-    const dx = touchTargetX - player.x, dy = touchTargetY - player.y;
-    const d = Math.hypot(dx, dy);
-    const arrival = Math.min(1, Math.max(0, (d - 4) / 36));
-    ax = d > 4 ? dx / d * arrival : 0;
-    ay = d > 4 ? dy / d * arrival : 0;
   }
   const forwardMag = Math.max(0, -ay);   // [0..1]
   const reverseMag = Math.max(0,  ay);   // [0..1]
@@ -3489,7 +3465,6 @@ function loop(now) {
 
 function clearControls() {
   Object.keys(keys).forEach(k => keys[k] = false);
-  touchTargetX = touchTargetY = null;
   joyActive = false; joyX = joyY = 0;
   document.querySelector('.joystick').classList.remove('dragging');
   document.querySelector('.paddle').setAttribute('transform', 'translate(90 90)');
