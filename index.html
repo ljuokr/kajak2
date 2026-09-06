@@ -107,6 +107,7 @@
     #sound-start-btn .sound-glyph { font-size: 27px; line-height: 1; }
     #sound-start-btn small { display: block; font: 600 10px system-ui; margin-top: 3px; opacity: .78; }
     #sound-status { min-height: 15px; font-size: 10px; line-height: 1.4; margin: -3px 0 12px; color: #426268; }
+    #iphone-sound-hint { margin: -3px 0 10px; font-size: 12px; font-weight: 750; line-height: 1.4; color: #173f45; }
     @media (max-height: 640px) { #welcome { overflow-y: auto; } .welcome-card { margin: auto; } #sound-start-btn { min-height: 54px; padding: 9px 12px; margin-bottom: 8px; } #sound-status { margin-bottom: 8px; } }
     #start-btn { width: 100%; padding: 15px; border: 0; border-radius: 14px; background: #c84924; color: white; font: 750 16px system-ui; cursor: pointer; }
     #start-btn:hover { background: #a93818; }
@@ -134,11 +135,12 @@
     <h1 id="welcome-title">Baby an Bord.</h1>
     <p>Ins Flussabenteuer! Sammelt Proviant, umfahrt Felsen und entschlüsselt den geheimen Code für die Schatzkiste.</p>
     <p class="controls">Mit den Pfeiltasten steuern: ← ↑ ↓ →</p>
-    <button id="sound-start-btn" type="button" aria-pressed="false" aria-describedby="sound-status">
+    <button id="sound-start-btn" type="button" aria-pressed="false" aria-describedby="iphone-sound-hint sound-status">
       <span class="sound-glyph" aria-hidden="true">🔊</span>
-      <span><span id="sound-label">Sound einschalten</span><small id="sound-detail">Fluss, Paddelschläge &amp; Musik</small></span>
+      <span><span id="sound-label">Sound einschalten</span><small id="sound-detail">Drunken Sailor &amp; Flussklänge</small></span>
     </button>
-    <p id="sound-status" role="status" aria-live="polite">Einmal antippen und die Flussklänge hören.</p>
+    <p id="iphone-sound-hint">iPhone: Klingelton einschalten<br>– Stummmodus aus.</p>
+    <p id="sound-status" role="status" aria-live="polite">Einmal antippen und Musik &amp; Flussklänge hören.</p>
     <button id="start-btn">Leinen los →</button>
   </div>
 </div>
@@ -1096,8 +1098,8 @@ function syncSoundUI() {
   btn.setAttribute('aria-pressed', String(ready));
   btn.setAttribute('aria-busy', String(audioPending));
   document.getElementById('sound-label').textContent = audioPending ? 'Sound wird aktiviert …' : ready ? 'Sound an ✓' : 'Sound einschalten';
-  document.getElementById('sound-detail').textContent = ready ? 'Antippen zum Stummschalten' : 'Fluss, Paddelschläge & Musik';
-  document.getElementById('sound-status').textContent = audioError || (audioPending ? 'Audio wird gestartet …' : ready ? 'Bereit! Lautstärke am Gerät einstellen.' : !soundMuted ? 'Zum Fortsetzen Sound noch einmal antippen.' : 'Einmal antippen und die Flussklänge hören.');
+  document.getElementById('sound-detail').textContent = ready ? 'Drunken Sailor · Antippen zum Stummschalten' : 'Drunken Sailor & Flussklänge';
+  document.getElementById('sound-status').textContent = audioError || (audioPending ? 'Audio wird gestartet …' : ready ? 'Bereit! Lautstärke am Gerät einstellen.' : !soundMuted ? 'Zum Fortsetzen Sound noch einmal antippen.' : 'Einmal antippen und Musik & Flussklänge hören.');
 }
 
 function audioCanPlay() { return !soundMuted && musicCtx?.state === 'running' && !document.hidden; }
@@ -1224,7 +1226,7 @@ function audioScheduler() {
   for (let scheduled = 0; nextMusicTime < now + 0.2 && scheduled < 2; scheduled++) {
     const step = musicStep % SAILOR_STEPS, bar = Math.floor(step / 8), note = sailorMelodySteps.get(step);
     if (note) audioTone(note.frequency, nextMusicTime, note.length * SAILOR_BEAT * 0.92,
-      0.135, musicBus, 'triangle', note.frequency, true);
+      0.22, musicBus, 'triangle', note.frequency, true);
     if (step % 4 === 0) {
       const bass = SAILOR_BASS[bar];
       audioTone(bass, nextMusicTime, 2 * SAILOR_BEAT * 0.92, 0.065, musicBus, 'triangle', bass, true);
